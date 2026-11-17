@@ -1,0 +1,1210 @@
+---
+title: "Study-level meta-analysis: Δ Net Benefit for age cutoffs"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  dplyr,
+  tidyr,
+  purrr,
+  readr,
+  ggplot2,
+  scales,
+  stringr,
+  metafor,
+  patchwork
+  # bayesDCA # Removed as it causes installation issues and might not be used here
+)
+
+dir.create("Results", showWarnings = FALSE)
+dir.create("Results/Metaanalysis", recursive = TRUE, showWarnings = FALSE)
+
+# Analysis settings
+thresholds <- seq(0, 0.30, by = 0.01)
+age_cutoffs <- c(35, 40, 45)
+bootstrap_reps <- 500
+set.seed(20260213)
+```
+
+```{r}
+
+
+# ------------------------------------------------------------------------------
+# Helper Functions
+# ------------------------------------------------------------------------------
+
+inv_logit <- function(x) 1 / (1 + exp(-x))
+
+net_benefit <- function(treat, outcome, pt) {
+  treat <- as.integer(treat)
+  outcome <- as.integer(outcome)
+
+  keep <- !is.na(treat) & !is.na(outcome)
+  treat <- treat[keep]
+  outcome <- outcome[keep]
+
+  n <- length(outcome)
+  if (n == 0) return(NA_real_)
+
+  w <- pt / (1 - pt)
+  tp <- sum(treat == 1 & outcome == 1)
+  fp <- sum(treat == 1 & outcome == 0)
+
+  (tp / n) - (fp / n) * w
+}
+
+nb_screen_all <- function(outcome, pt) {
+  outcome <- as.integer(outcome)
+  outcome <- outcome[!is.na(outcome)]
+  n <- length(outcome)
+  if (n == 0) return(NA_real_)
+
+  prev <- mean(outcome)
+  w <- pt / (1 - pt)
+  prev - (1 - prev) * w
+}
+
+nb_screen_none <- function() 0
+
+delta_nb <- function(dat, cutoff, pt, comparator = c("all", "none")) {
+  comparator <- match.arg(comparator)
+
+  treat <- as.integer(dat$age > cutoff)
+  outcome <- as.integer(dat$outcome)
+
+  nb_strat <- net_benefit(treat, outcome, pt)
+
+  nb_comp <- switch(
+    comparator,
+    all = nb_screen_all(outcome, pt),
+    none = nb_screen_none()
+  )
+
+  nb_strat - nb_comp
+}
+
+fit_re_meta <- function(yi, vi) {
+  if (length(yi) < 2) return(NULL)
+  tryCatch(
+    metafor::rma(yi = yi, vi = vi, method = "REML"),
+    error = function(e) NULL
+  )
+}
+
+extract_meta_stats <- function(model) {
+  if (is.null(model)) {
+    return(tibble(
+      pooled = NA_real_,
+      ci_lb = NA_real_,
+      ci_ub = NA_real_,
+      pi_lb = NA_real_,
+      pi_ub = NA_real_,
+      tau2 = NA_real_,
+      i2 = NA_real_,
+      q = NA_real_,
+      q_p = NA_real_,
+      k = NA_integer_
+    ))
+  }
+
+  pred <- metafor::predict.rma(model)
+
+  tibble(
+    pooled = unname(pred$pred),
+    ci_lb = unname(pred$ci.lb),
+    ci_ub = unname(pred$ci.ub),
+    pi_lb = unname(pred$pi.lb),
+    pi_ub = unname(pred$pi.ub),
+    tau2 = unname(model$tau2),
+    i2 = unname(model$I2),
+    q = unname(model$QE),
+    q_p = unname(model$QEp),
+    k = unname(model$k)
+  )
+}
+
+fmt_num <- function(x, digits = 3) {
+  ifelse(is.finite(x), formatC(x, digits = digits, format = "f"), "NA")
+}
+
+fmt_p <- function(p) {
+  p <- as.numeric(p)
+  ifelse(
+    !is.finite(p),
+    "NA",
+    ifelse(
+      p < 0.001,
+      "<0.001",
+      formatC(p, digits = 3, format = "f")
+    )
+  )
+}
+
+re_weight_pct <- function(vi, tau2) {
+  vi <- as.numeric(vi)
+  tau2 <- as.numeric(tau2)
+  if (!is.finite(tau2)) return(rep(NA_real_, length(vi)))
+  if (any(!is.finite(vi))) return(rep(NA_real_, length(vi)))
+  w <- 1 / (vi + tau2)
+  100 * w / sum(w)
+}
+
+save_funnel_and_bias <- function(model, file, title, xlab = "Effect") {
+  if (is.null(model) || !is.finite(model$k) || model$k < 2) return(invisible(NULL))
+
+  grDevices::png(file, width = 2200, height = 1600, res = 300)
+  on.exit(grDevices::dev.off(), add = TRUE)
+
+  metafor::funnel(model, main = title, xlab = xlab, yaxis = "seinv")
+  invisible(NULL)
+}
+
+find_zero_crossings <- function(x, y) {
+  x <- as.numeric(x)
+  y <- as.numeric(y)
+  keep <- is.finite(x) & is.finite(y)
+  x <- x[keep]
+  y <- y[keep]
+  if (length(x) < 2) return(numeric(0))
+
+  o <- order(x)
+  x <- x[o]
+  y <- y[o]
+
+  crossings <- numeric(0)
+  for (i in seq_len(length(x) - 1)) {
+    x1 <- x[i]; x2 <- x[i + 1]
+    y1 <- y[i]; y2 <- y[i + 1]
+
+    if (y1 == 0) {
+      crossings <- c(crossings, x1)
+      next
+    }
+    if ((y1 < 0 && y2 > 0) || (y1 > 0 && y2 < 0) || y2 == 0) {
+      if (y2 == 0) {
+        crossings <- c(crossings, x2)
+      } else {
+        # Linear interpolation for y=0
+        crossings <- c(crossings, x1 + (0 - y1) * (x2 - x1) / (y2 - y1))
+      }
+    }
+  }
+
+  unique(round(crossings, 6))
+}
+
+forest_plot_simple <- function(
+  df,
+  pooled_row,
+  title,
+  file,
+  x_label,
+  x_limits = NULL,
+  x_breaks = NULL,
+  x_labels = NULL,
+  x_trans = "identity",
+  ref_line = NULL,
+  ref_linetype = "solid",
+  caption = NULL
+) {
+  # Prepare data
+  df_plot <- df %>%
+    mutate(
+      study_label = as.character(study),
+      type = "study",
+      weight_val = if("weight_pct" %in% names(.)) weight_pct else 1,
+      size_val = weight_val  # Size proportional to weight
+    )
+
+  # Check if metadata columns exist for extended labels
+  if ("custom_label" %in% names(df)) {
+     df_plot <- df_plot %>% mutate(study_label = custom_label)
+  } else if ("recruitment" %in% names(df)) {
+     df_plot <- df_plot %>%
+       mutate(study_label = paste0(study, " (", recruitment, ")"))
+  }
+
+  pooled_plot <- pooled_row %>%
+    mutate(
+      study_label = "Pooled (REML)",
+      type = "pooled",
+      weight_val = NA_real_, 
+      size_val = NA_real_ # Pooled diamond dealt with separately
+    )
+
+  # Combine
+  combined <- bind_rows(df_plot, pooled_plot) %>%
+    mutate(
+      # Order: Pooled at bottom, then studies in reverse alphabetical or provided order
+      # If study column is already a factor, preserve order; else sort
+      study_orig = study_label
+    )
+    
+  # SORTING BY EFFECT SIZE (estimate)
+  # Arrange studies by estimate
+  # The user wants "Ascending" order. Assuming small effect at top?
+  # Let's try arrange(estimate). This puts Small -> Large.
+  # So study_levs = A(0.5), B(1.0), C(2.0).
+  # rev(study_levs) = C, B, A.
+  # Levels = Pooled, C, B, A.
+  # Y=1 Pooled, Y=2 C, Y=3 B, Y=4 A.
+  # Plot: A (Top), B, C, Pooled.
+  # This is Ascending down: 0.5 -> 1.0 -> 2.0.
+  df_sorted <- df_plot %>% arrange(estimate) 
+  
+  study_levs <- df_sorted$study_label
+  
+  # final_levels: 1=Pooled, 2=Large, ..., N=Small.
+  final_levels <- c("Pooled (REML)", rev(study_levs))
+  
+  combined <- combined %>%
+    mutate(
+      study_factor = factor(study_label, levels = final_levels),
+      y_pos = as.integer(study_factor)
+    )
+    
+  # Safety check: if any NA y_pos, assign them temporary placement to avoid error, but warn
+  if(any(is.na(combined$y_pos))) {
+     combined$y_pos[is.na(combined$y_pos)] <- length(final_levels) + 1
+  }
+
+  # Text labels for Forest Plot
+  combined <- combined %>%
+    mutate(
+      est_txt = fmt_num(estimate, 2),
+      ci_txt = paste0("[", fmt_num(ci_lb, 2), ", ", fmt_num(ci_ub, 2), "]"),
+      weight_txt = ifelse(type == "pooled", "100.0%", paste0(formatC(weight_val, digits = 1, format = "f"), "%")),
+      label_right = paste0(est_txt, " ", ci_txt)
+    )
+
+  # Diamond polygon for pooled
+  # Width = CI
+  # Height = fixed, e.g. 0.3 units
+  poly_h <- 0.3
+  pooled_y <- 1
+  
+  diamond_df <- tibble(
+    x = c(pooled_row$ci_lb, pooled_row$estimate, pooled_row$ci_ub, pooled_row$estimate),
+    y = c(pooled_y, pooled_y + poly_h, pooled_y, pooled_y - poly_h),
+    group = 1
+  )
+
+  pi_df <- NULL
+  if (all(c("pi_lb", "pi_ub") %in% names(pooled_row))) {
+    pi_lb <- pooled_row$pi_lb
+    pi_ub <- pooled_row$pi_ub
+    if (is.finite(pi_lb) && is.finite(pi_ub) && (pi_lb < pi_ub)) {
+      pi_df <- tibble(
+        estimate = pooled_row$estimate,
+        pi_lb = pi_lb,
+        pi_ub = pi_ub,
+        y_pos = pooled_y
+      )
+    }
+  }
+
+  # Heterogeneity Stats in Caption
+  het_text <- ""
+  if ("tau2" %in% names(pooled_row) && !is.na(pooled_row$tau2)) {
+     het_text <- paste0(
+        "Heterogeneity: Tau\u00b2 = ", fmt_num(pooled_row$tau2, 2), 
+        "; Chi\u00b2 = ", fmt_num(pooled_row$q, 1), 
+        ", df = ", pooled_row$k - 1, 
+        " (P = ", fmt_p(pooled_row$q_p), "); ",
+        "I\u00b2 = ", fmt_num(pooled_row$i2, 0), "%"
+     )
+  }
+  
+  full_caption <- if(is.null(caption)) het_text else paste0(caption, "\n", het_text)
+
+  # --- DYNAMIC PLOT LIMITS & TEXT PLACEMENT ---
+  max_ci <- max(combined$ci_ub, na.rm = TRUE)
+  min_ci <- min(combined$ci_lb, na.rm = TRUE)
+  
+  # Safe min for log
+  if (x_trans == "log10") {
+      if(min_ci <= 0) min_ci <- min(combined$ci_lb[combined$ci_lb > 0], na.rm = TRUE)
+  }
+
+  # Targets for plot limits (what shows on axis)
+  if (is.null(x_limits)) {
+    if (x_trans == "log10") {
+      # Expand slightly: min/1.5, max*1.5
+      targets <- c(min_ci / 1.5, max_ci * 1.5)
+    } else {
+      # Linear axis: avoid forcing 0 into view for ratio measures (e.g., OR)
+      targets <- c(min_ci, max_ci)
+
+      include_zero <- isTRUE(ref_line == 0) || (min_ci < 0)
+      if (include_zero) targets[1] <- min(0, targets[1])
+    }
+  } else {
+    targets <- x_limits
+  }
+  
+  # Calculate Text Positions outside the plot area
+  if (x_trans == "log10") {
+    log_min <- log10(targets[1])
+    log_max <- log10(targets[2])
+    log_range <- log_max - log_min
+
+    # Place Effect text at ~10% beyond right edge (in log spacing)
+    pos_est <- 10^(log_max + 0.05 * log_range)
+    # Place Weight text closer to the right edge (avoid clipping)
+    pos_wt <- 10^(log_max + 0.30 * log_range)
+
+    # Place study header in the left gutter (outside plotting region)
+    pos_study_hdr <- 10^(log_min - 0.40 * log_range)
+  } else {
+    lin_range <- targets[2] - targets[1]
+    pos_est <- targets[2] + 0.05 * lin_range
+    pos_wt <- targets[2] + 0.30 * lin_range
+
+    # Place study header in the left gutter (outside plotting region)
+    pos_study_hdr <- targets[1] - 0.40 * lin_range
+  }
+
+  # Create plot
+  p <- ggplot(combined, aes(y = y_pos)) +
+    # Vertical Reference Line
+    {if (!is.null(ref_line)) geom_vline(xintercept = ref_line, color = "black", linetype = ref_linetype) } +
+    
+    # Study Error Bars
+    geom_errorbarh(
+      data = filter(combined, type == "study"),
+      aes(xmin = ci_lb, xmax = ci_ub, x = estimate),
+      height = 0, color = "black", linewidth = 0.6
+    ) +
+    
+    # Study Squares
+    geom_point(
+      data = filter(combined, type == "study"),
+      aes(x = estimate, size = size_val),
+      shape = 22, fill = "black", color = "black"
+    ) +
+
+    # Prediction interval (optional) behind pooled diamond
+    {if (!is.null(pi_df)) geom_errorbarh(
+      data = pi_df,
+      aes(xmin = pi_lb, xmax = pi_ub, x = estimate, y = y_pos),
+      inherit.aes = FALSE,
+      height = 0.18,
+      color = "black",
+      linetype = "dashed",
+      linewidth = 0.6
+    ) } +
+    
+    # Pooled Diamond
+    geom_polygon(data = diamond_df, aes(x = x, y = y), fill = "black", inherit.aes = FALSE) +
+    
+    scale_size_area(max_size = 6, guide = "none") + 
+    
+    # Text Columns - Using calculated positions
+    geom_text(aes(x = pos_est, label = label_right), hjust = 0, size = 3.8) +
+    geom_text(aes(x = pos_wt, label = weight_txt), hjust = 0, size = 3.8) +
+    annotate("text", x = pos_est, y = length(final_levels) + 1, label = "Effect [95% CI]", hjust = 0, fontface = "bold", size = 4.2) +
+    annotate("text", x = pos_wt, y = length(final_levels) + 1, label = "Weight", hjust = 0, fontface = "bold", size = 4.2) +
+    annotate("text", x = pos_study_hdr, y = length(final_levels) + 1, label = "Study (Years recruited)", hjust = 0, fontface = "bold", size = 4.2) +
+
+    scale_x_continuous(
+      name = x_label,
+      trans = x_trans, 
+      breaks = if (!is.null(x_breaks)) x_breaks else if (x_trans == "log10") scales::log_breaks(n = 6) else scales::pretty_breaks(n = 6),
+      labels = if (!is.null(x_labels)) x_labels else scales::number_format(accuracy = 0.01)
+    ) +
+    
+    scale_y_continuous(
+      breaks = 1:length(final_levels),
+      labels = final_levels,
+      expand = expansion(mult = 0.05)
+    ) +
+    
+    # Coordinate system with clipping off
+    coord_cartesian(xlim = targets, clip = "off") +
+    
+    labs(
+      title = title,
+      y = NULL,
+      caption = full_caption
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+      axis.line.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+      axis.title.x = element_text(size = 13),
+      axis.text.x = element_text(size = 12),
+      axis.text.y = element_text(color = "black", hjust = 0, vjust = 0.5, size = 12),
+      plot.caption.position = "plot",
+      plot.caption = element_text(size = 11, hjust = 0, margin = margin(t = 8, l = 6)),
+      plot.margin = margin(12, 280, 12, 120)
+    )
+
+  ggsave(file, plot = p, width = 13.5, height = 6.5 + 0.35 * length(study_levs), dpi = 300)
+  p
+}
+
+plot_subgroup_dca <- function(meta_res) {
+  df <- meta_res$meta %>%
+    filter(!is.na(pooled)) 
+    
+  colors <- c(
+    "Screen All" = "black",
+    "Screen None" = "black",
+    "Age > 35" = "#1b9e77",
+    "Age > 40" = "#d95f02",
+    "Age > 45" = "#7570b3"
+  )
+  
+  linetypes <- c(
+    "Screen All" = "solid",
+    "Screen None" = "dotted",
+    "Age > 35" = "solid",
+    "Age > 40" = "solid",
+    "Age > 45" = "solid"
+  )
+  
+  df <- df %>%
+    mutate(strategy = factor(strategy, levels = c("Screen All", "Screen None", "Age > 35", "Age > 40", "Age > 45")))
+
+  plot_title <- meta_res$level
+  
+  if (meta_res$name == "HBV") {
+    if (meta_res$level == "Negative") plot_title <- "HBV non-reactive"
+    if (meta_res$level == "Positive") plot_title <- "HBV reactive"
+  } else if (meta_res$name == "HIV") {
+    if (meta_res$level == "Negative") plot_title <- "HIV non-reactive"
+    if (meta_res$level == "Positive") plot_title <- "HIV reactive"
+  } else if (meta_res$name == "Hazardous alcohol use") {
+    if (meta_res$level == "No") plot_title <- "No hazardous alcohol use"
+    if (meta_res$level == "Yes") plot_title <- "Hazardous alcohol use"
+  } else if (meta_res$name == "Obesity") {
+    # Keep as is
+  } else if (meta_res$name == "Aboriginal") {
+    # Keep as is
+  } else if (meta_res$name == "Gender") {
+    # Keep as is
+  }
+
+  if (!is.null(meta_res$n)) {
+    plot_title <- paste0(plot_title, "\n(N=", meta_res$n, ")")
+  }
+
+  df <- df %>% arrange(strategy, threshold)
+
+  p <- ggplot(df, aes(x = threshold, y = pooled, color = strategy, linetype = strategy, group = strategy)) +
+    geom_smooth(method = "loess", formula = y ~ x, se = FALSE, span = 0.6, linewidth = 1) +
+    coord_cartesian(
+        xlim = c(0, 0.3),
+        ylim = c(-0.01, max(0.1, max(df$pooled, na.rm=TRUE) * 1.05))
+    ) + 
+    scale_x_continuous(breaks = seq(0, 0.3, 0.05)) +
+    labs(
+      title = plot_title,
+      x = "Threshold Probability", 
+      y = "Net Benefit",
+      color = "Strategy",
+      linetype = "Strategy"
+    ) +
+    scale_color_manual(values = colors) +
+    scale_linetype_manual(values = linetypes) +
+    theme_classic() +
+    theme(
+       legend.position = "bottom",
+       plot.title = element_text(face="bold", hjust=0.5, size=11),
+       axis.title = element_text(size=10),
+       axis.text = element_text(size=9)
+    )
+    
+  return(p)
+}
+```
+
+```{r}
+# ------------------------------------------------------------------------------
+# Analysis Function (Outcome-Agnostic)
+# ------------------------------------------------------------------------------
+
+run_full_analysis <- function(data, outcome_col_name, analysis_label, file_suffix) {
+  
+  cat(paste0("\n\n>>> STARTING ANALYSIS: ", analysis_label, " <<<\n\n"))
+  
+  # Ensure outcome exists and filter strictly
+  cohort_analysis <- data %>%
+    mutate(outcome = !!sym(outcome_col_name)) %>%
+    filter(!is.na(outcome))
+    
+  # 1. Prevalence
+  prev_tbl <- cohort_analysis %>%
+    group_by(study) %>%
+    summarise(
+      n = n(),
+      events = sum(outcome == 1, na.rm = TRUE),
+      prev = events / n,
+      .groups = "drop"
+    )
+
+  write_csv(prev_tbl, paste0("Results/Metaanalysis/Meta_StudyPrevalence_", file_suffix, ".csv"))
+  
+  prev_es <- metafor::escalc(measure = "PLO", xi = prev_tbl$events, ni = prev_tbl$n, slab = prev_tbl$study, add = 0.5, to = "only0")
+  prev_re <- fit_re_meta(prev_es$yi, prev_es$vi)
+  
+  if (!is.null(prev_re)) {
+    prev_stats <- extract_meta_stats(prev_re) %>%
+      mutate(
+        pooled_prev = inv_logit(pooled),
+        pooled_prev_ci_lb = inv_logit(ci_lb),
+        pooled_prev_ci_ub = inv_logit(ci_ub)
+      )
+      
+    prev_weight_pct <- re_weight_pct(prev_es$vi, prev_re$tau2)
+
+    prev_study_forest <- prev_es %>%
+      { tibble(study = prev_tbl$study, yi = . $yi, vi = . $vi, weight_pct = prev_weight_pct) } %>%
+      left_join(study_metadata, by="study") %>% 
+      mutate(
+        custom_label = paste0(study, " (", recruitment, ")")
+      ) %>%
+      transmute(
+        study,
+        estimate = inv_logit(yi),
+        ci_lb = inv_logit(yi - 1.96 * sqrt(vi)),
+        ci_ub = inv_logit(yi + 1.96 * sqrt(vi)),
+        weight_pct,
+        custom_label
+      )
+      
+    prev_pooled_row <- prev_stats %>%
+      mutate(
+        estimate = pooled_prev,
+        ci_lb = pooled_prev_ci_lb,
+        ci_ub = pooled_prev_ci_ub,
+        pi_lb = inv_logit(pi_lb),
+        pi_ub = inv_logit(pi_ub)
+      )
+    
+    forest_plot_simple(
+      df = prev_study_forest, pooled_row = prev_pooled_row,
+      title = paste0("Study prevalence of ", analysis_label, " (pooled RE)"),
+      file = paste0("Results/Metaanalysis/Forest_Prevalence_", file_suffix, ".png"),
+      x_label = "Prevalence", x_limits = c(0, 0.5),
+      caption = paste0("Pooled: ", fmt_num(prev_stats$pooled_prev, 3))
+    )
+
+    save_funnel_and_bias(
+      model = prev_re,
+      file = paste0("Results/Metaanalysis/Funnel_Prevalence_", file_suffix, ".png"),
+      title = paste0("Funnel plot: prevalence of ", analysis_label),
+      xlab = "Logit prevalence"
+    )
+
+    prev_egger <- tryCatch(metafor::regtest(prev_re, model = "rma"), error = function(e) NULL)
+    if (!is.null(prev_egger)) {
+      write_csv(
+        tibble(
+          analysis = analysis_label,
+          type = "prevalence",
+          k = prev_re$k,
+          z = unname(prev_egger$zval),
+          p = unname(prev_egger$pval)
+        ),
+        paste0("Results/Metaanalysis/BiasTest_Prevalence_", file_suffix, ".csv")
+      )
+    }
+  }
+
+  # 2. Age Effect (OR per 5 years)
+  age_effect_tbl <- cohort_analysis %>%
+    group_by(study) %>%
+    group_modify(~ {
+      dat <- .x
+      if (n_distinct(dat$outcome) < 2) return(tibble(log_or_per5 = NA_real_, se = NA_real_))
+      
+      fit <- tryCatch(
+        glm(outcome ~ I(age / 5), data = dat, family = binomial()),
+        error = function(e) NULL
+      )
+      if (is.null(fit)) return(tibble(log_or_per5 = NA_real_, se = NA_real_))
+      s <- coef(summary(fit))
+      if (!"I(age/5)" %in% rownames(s)) return(tibble(log_or_per5 = NA_real_, se = NA_real_))
+      
+      est <- unname(s["I(age/5)", "Estimate"])
+      se <- unname(s["I(age/5)", "Std. Error"])
+      if (abs(est) > 10 || se > 10) return(tibble(log_or_per5 = NA_real_, se = NA_real_))
+      
+      tibble(log_or_per5 = est, se = se)
+    }) %>%
+    ungroup() %>%
+    filter(!is.na(log_or_per5)) %>%
+    mutate(vi = se^2)
+    
+  write_csv(age_effect_tbl, paste0("Results/Metaanalysis/Meta_StudyAgeEffect_", file_suffix, ".csv"))
+  
+  age_re <- fit_re_meta(age_effect_tbl$log_or_per5, age_effect_tbl$vi)
+  if (!is.null(age_re)) {
+    age_stats <- extract_meta_stats(age_re) %>% mutate(or = exp(pooled), or_ci_lb = exp(ci_lb), or_ci_ub = exp(ci_ub))
+    write_csv(age_stats, paste0("Results/Metaanalysis/Meta_StudyAgeEffect_Summary_", file_suffix, ".csv"))
+    
+    age_weight_pct <- re_weight_pct(age_effect_tbl$vi, age_re$tau2)
+
+    age_study_forest <- age_effect_tbl %>%
+      mutate(weight_pct = age_weight_pct) %>%
+      left_join(study_metadata, by="study") %>%
+      mutate(
+        custom_label = paste0(study, " (", recruitment, ")")
+      ) %>%
+      transmute(
+        study,
+        estimate = exp(log_or_per5),
+        ci_lb = exp(log_or_per5 - 1.96 * se),
+        ci_ub = exp(log_or_per5 + 1.96 * se),
+        weight_pct,
+        custom_label
+      )
+      
+    age_pooled_row <- age_stats %>%
+      mutate(
+        estimate = exp(pooled),
+        ci_lb = exp(ci_lb),
+        ci_ub = exp(ci_ub),
+        pi_lb = exp(pi_lb),
+        pi_ub = exp(pi_ub)
+      )
+    
+    forest_plot_simple(
+      df = age_study_forest, pooled_row = age_pooled_row,
+      title = paste0("Age effect on ", analysis_label, " (OR per 5 years)"),
+      file = paste0("Results/Metaanalysis/Forest_AgeEffect_", file_suffix, ".png"),
+      x_label = "Odds ratio",
+      x_limits = c(0, 10),
+      x_breaks = c(0, 1:10),
+      x_labels = c("0", as.character(1:10)),
+      x_trans = "identity",
+      ref_line = 1,
+      ref_linetype = "dotted",
+      caption = paste0("Pooled OR: ", fmt_num(exp(age_stats$pooled), 2))
+    )
+
+    save_funnel_and_bias(
+      model = age_re,
+      file = paste0("Results/Metaanalysis/Funnel_AgeEffect_", file_suffix, ".png"),
+      title = paste0("Funnel plot: age effect on ", analysis_label),
+      xlab = "Log OR (per 5y)"
+    )
+
+    age_egger <- tryCatch(metafor::regtest(age_re, model = "rma"), error = function(e) NULL)
+    if (!is.null(age_egger)) {
+      write_csv(
+        tibble(
+          analysis = analysis_label,
+          type = "age_effect",
+          k = age_re$k,
+          z = unname(age_egger$zval),
+          p = unname(age_egger$pval)
+        ),
+        paste0("Results/Metaanalysis/BiasTest_AgeEffect_", file_suffix, ".csv")
+      )
+    }
+  }
+
+  # 3. Delta Net Benefit
+  meta_inputs <- crossing(
+    study = sort(unique(cohort_analysis$study)),
+    cutoff = age_cutoffs,
+    threshold = thresholds,
+    comparator = "all"
+  ) %>%
+    mutate(estimate = NA_real_, se = NA_real_, nb_strategy = NA_real_, nb_screen_all = NA_real_, se_nb_strategy = NA_real_)
+
+  for (i in seq_len(nrow(meta_inputs))) {
+    st <- meta_inputs$study[i]
+    cutoff <- meta_inputs$cutoff[i]
+    pt <- meta_inputs$threshold[i]
+    comp <- meta_inputs$comparator[i]
+
+    dat <- cohort_analysis %>% filter(study == st) %>% select(age, outcome)
+    if (nrow(dat) == 0) next
+    
+    treat <- as.integer(dat$age > cutoff)
+    meta_inputs$nb_strategy[i] <- net_benefit(treat, dat$outcome, pt)
+    meta_inputs$nb_screen_all[i] <- nb_screen_all(dat$outcome, pt)
+      
+    if (is.finite(meta_inputs$nb_strategy[i])) {
+      # se_nb_strategy (raw NB)
+      vals_raw <- replicate(50, { 
+         idx <- sample.int(nrow(dat), nrow(dat), replace=TRUE)
+         treat_b <- treat[idx]; out_b <- dat$outcome[idx]
+         net_benefit(treat_b, out_b, pt)
+      })
+      meta_inputs$se_nb_strategy[i] <- sd(vals_raw, na.rm=TRUE)
+      
+      # se (Delta NB)
+      vals_delta <- replicate(50, {
+         idx <- sample.int(nrow(dat), nrow(dat), replace=TRUE)
+         treat_b <- treat[idx]; out_b <- dat$outcome[idx]
+         nb1 <- net_benefit(treat_b, out_b, pt)
+         nb2 <- nb_screen_all(out_b, pt)
+         nb1 - nb2
+      })
+      meta_inputs$estimate[i] <- meta_inputs$nb_strategy[i] - meta_inputs$nb_screen_all[i] # Point estimate
+      meta_inputs$se[i] <- sd(vals_delta, na.rm=TRUE)
+    }
+  }
+
+  meta_inputs <- meta_inputs %>%
+    mutate(
+      strategy = paste0("Age > ", cutoff),
+      vi = se^2,
+      vi_nb = se_nb_strategy^2,
+      ci_lb = estimate - 1.96 * se,
+      ci_ub = estimate + 1.96 * se
+    )
+
+  write_csv(meta_inputs, paste0("Results/Metaanalysis/Meta_DeltaNB_", file_suffix, "_Data.csv"))
+
+  # 4. Meta-Analyze NB (Raw) for DCA Curves
+  meta_nb_summary <- meta_inputs %>%
+    filter(is.finite(nb_strategy), is.finite(vi_nb), vi_nb > 0) %>%
+    group_by(strategy, threshold) %>%
+    group_modify(~ {
+      m <- fit_re_meta(.x$nb_strategy, .x$vi_nb)
+      extract_meta_stats(m)
+    }) %>% ungroup() %>% rename(nb_pooled = pooled, nb_ci_lb = ci_lb, nb_ci_ub = ci_ub)
+
+  screen_all_inputs <- meta_inputs %>% select(study, threshold) %>% distinct() %>% mutate(nb_all = NA_real_, vi_all = NA_real_)
+  
+  for(i in seq_len(nrow(screen_all_inputs))) {
+    st <- screen_all_inputs$study[i]; pt <- screen_all_inputs$threshold[i]
+    dat <- cohort_analysis %>% filter(study == st) %>% select(outcome)
+    if (nrow(dat) > 0) {
+      screen_all_inputs$nb_all[i] <- nb_screen_all(dat$outcome, pt)
+      p <- mean(dat$outcome); w <- pt/(1-pt); n <- nrow(dat)
+      screen_all_inputs$vi_all[i] <- ((1+w)^2) * (p*(1-p)/n)
+    }
+  }
+  
+  meta_all_summary <- screen_all_inputs %>%
+    filter(is.finite(nb_all), is.finite(vi_all), vi_all > 0) %>%
+    group_by(threshold) %>%
+    group_modify(~ {
+      m <- fit_re_meta(.x$nb_all, .x$vi_all)
+      extract_meta_stats(m)
+    }) %>% ungroup() %>% rename(nb_pooled = pooled, nb_ci_lb = ci_lb, nb_ci_ub = ci_ub) %>% mutate(strategy = "Screen All")
+  
+  all_nb_meta <- bind_rows(
+    meta_nb_summary %>% select(strategy, threshold, nb_pooled, nb_ci_lb, nb_ci_ub),
+    meta_all_summary %>% select(strategy, threshold, nb_pooled, nb_ci_lb, nb_ci_ub),
+    tibble(strategy = "Screen None", threshold = unique(meta_nb_summary$threshold), nb_pooled = 0, nb_ci_lb = 0, nb_ci_ub = 0)
+  )
+
+  write_csv(
+    all_nb_meta %>% arrange(strategy, threshold),
+    paste0("Results/Metaanalysis/Meta_PooledNB_", file_suffix, ".csv")
+  )
+
+  # Identify where pooled NB(strategy) crosses pooled NB(Screen All)
+  screen_all_curve <- all_nb_meta %>%
+    filter(strategy == "Screen All") %>%
+    select(threshold, nb_screen_all = nb_pooled)
+
+  diff_vs_all <- all_nb_meta %>%
+    filter(strategy != "Screen All") %>%
+    left_join(screen_all_curve, by = "threshold") %>%
+    mutate(nb_diff_vs_screen_all = nb_pooled - nb_screen_all)
+
+  crossings_tbl <- diff_vs_all %>%
+    group_by(strategy) %>%
+    summarise(
+      crossing_thresholds = {
+        xs <- find_zero_crossings(threshold, nb_diff_vs_screen_all)
+        if (length(xs) == 0) NA_character_ else paste0(xs, collapse = ";")
+      },
+      first_crossing = {
+        xs <- find_zero_crossings(threshold, nb_diff_vs_screen_all)
+        if (length(xs) == 0) NA_real_ else min(xs)
+      },
+      .groups = "drop"
+    )
+
+  write_csv(
+    crossings_tbl,
+    paste0("Results/Metaanalysis/Meta_PooledNB_CrossesScreenAll_", file_suffix, ".csv")
+  )
+  
+  all_nb_meta_plot <- all_nb_meta %>% arrange(strategy, threshold)
+
+  p_dca_main <- ggplot(all_nb_meta_plot, aes(x = threshold, y = nb_pooled, color = strategy, linetype = strategy, group = strategy)) +
+    geom_smooth(method = "loess", formula = y ~ x, se = FALSE, span = 0.6, linewidth = 1) +
+    coord_cartesian(xlim = c(0, 0.3), ylim = c(-0.01, max(0.1, max(all_nb_meta$nb_pooled, na.rm=TRUE) * 1.05))) +
+    scale_x_continuous(breaks = seq(0, 0.3, 0.05)) +
+    labs(title = paste0("Overall Cohort: ", analysis_label), x = "Threshold Probability", y = "Net Benefit", color="Strategy", linetype="Strategy") +
+    scale_color_manual(values = c("Screen All"="black", "Screen None"="black", "Age > 35"="#1b9e77", "Age > 40"="#d95f02", "Age > 45"="#7570b3")) +
+    scale_linetype_manual(values = c("Screen All"="solid", "Screen None"="dotted", "Age > 35"="solid", "Age > 40"="solid", "Age > 45"="solid")) +
+    theme_classic() + theme(legend.position = "bottom")
+
+  ggsave(paste0("Results/Metaanalysis/Meta_DCA_Overall_", file_suffix, ".png"), p_dca_main, width = 8, height = 6)
+  
+  # 5. SUBGROUP DCA (Panel Logic)
+  
+  subgroups <- list(
+    list(name = "Gender", levels = c("Male", "Female")),
+    list(name = "Aboriginal", levels = c("Indigenous", "Non-Indigenous")),
+    list(name = "HIV", levels = c("Negative", "Positive")),
+    list(name = "HBV", levels = c("Negative", "Positive")),
+    list(name = "Hazardous alcohol use", levels = c("No", "Yes")),
+    list(name = "Obesity", levels = c("Not obese (BMI < 30)", "Obese (BMI >= 30)"))
+  )
+  
+  calc_sg_dca <- function(d, lvl_name) {
+    strats <- bind_rows(tibble(strat="Screen All", cut=NA), tibble(strat=paste0("Age > ", age_cutoffs), cut=age_cutoffs))
+    studies_sg <- unique(d$study)
+    res_list <- list()
+    t_vals <- thresholds
+    
+    for(ss in studies_sg) {
+      d_s <- d %>% filter(study == ss)
+      if(nrow(d_s) < 20) next
+      for(pt in t_vals) {
+        for(k in 1:nrow(strats)) {
+          st_lab <- strats$strat[k]; st_cut <- strats$cut[k]
+          if(st_lab == "Screen All") treat <- rep(1L, nrow(d_s)) else treat <- as.integer(d_s$age > st_cut)
+          
+          # Compute NB
+          val <- net_benefit(treat, d_s$outcome, pt)
+          
+          boots <- replicate(20, {
+             ix <- sample.int(nrow(d_s), nrow(d_s), T)
+             tr <- if(st_lab == "Screen All") rep(1L, nrow(d_s)) else as.integer(d_s$age[ix] > st_cut)
+             net_benefit(tr, d_s$outcome[ix], pt)
+          })
+          se <- sd(boots, na.rm=TRUE)
+
+          if(is.finite(val) & is.finite(se)) {
+             # If se is 0 (e.g. constant 0 events), add tiny epsilon to allow meta-analysis
+             vi_val <- if(se == 0) 1e-10 else se^2
+             res_list[[length(res_list)+1]] <- tibble(study=ss, threshold=pt, strategy=st_lab, nb=val, vi=vi_val)
+          }
+        }
+      }
+    }
+    
+    if(length(res_list)==0) return(NULL)
+    bind_rows(res_list) %>%
+      group_by(threshold, strategy) %>%
+      group_modify(~ {
+        if(nrow(.x) < 2) return(tibble(pooled=mean(.x$nb), ci_lb=NA, ci_ub=NA))
+        m <- fit_re_meta(.x$nb, .x$vi)
+        if (is.null(m)) {
+           # Fallback if meta-analysis fails (e.g. all 0 variance)
+           return(tibble(pooled=mean(.x$nb), ci_lb=NA, ci_ub=NA))
+        }
+        extract_meta_stats(m) %>% select(pooled, ci_lb, ci_ub)
+      }) %>% ungroup() %>%
+      bind_rows(tibble(threshold=unique(.$threshold), strategy="Screen None", pooled=0, ci_lb=0, ci_ub=0))
+  }
+  
+  all_plots <- list()
+  panel_data <- tibble()
+  
+  p_main_copy <- p_dca_main + labs(title = "Overall Cohort")
+  all_plots[["Overall"]] <- p_main_copy
+  panel_data <- bind_rows(panel_data, all_nb_meta %>% mutate(subgroup="Overall", level="Overall"))
+
+  for (sg in subgroups) {
+    for (lvl in sg$levels) {
+      
+      dat_sub <- NULL
+      if (sg$name == "Gender") dat_sub <- cohort_analysis %>% filter(gender == lvl)
+      else if (sg$name == "Aboriginal") dat_sub <- cohort_analysis %>% filter(aboriginal == lvl)
+      else if (sg$name == "HIV") dat_sub <- cohort_analysis %>% filter(hiv == lvl)
+      else if (sg$name == "HBV") dat_sub <- cohort_analysis %>% filter(hbv == lvl)
+      else if (sg$name == "Hazardous alcohol use") dat_sub <- cohort_analysis %>% filter(hazardous_alcohol_use == lvl)
+      else if (sg$name == "Obesity") {
+         if (str_detect(lvl, "< 30")) dat_sub <- cohort_analysis %>% filter(bmi < 30)
+         else dat_sub <- cohort_analysis %>% filter(bmi >= 30)
+      }
+      
+      if (!is.null(dat_sub) && nrow(dat_sub) > 50) {
+        n_sub <- nrow(dat_sub)
+        meta_res <- calc_sg_dca(dat_sub, lvl)
+        if (!is.null(meta_res)) {
+           p <- plot_subgroup_dca(list(meta=meta_res, name=sg$name, level=lvl, n=n_sub))
+           key <- paste(sg$name, lvl, sep="_")
+           all_plots[[key]] <- p
+           panel_data <- bind_rows(panel_data, meta_res %>% mutate(subgroup=sg$name, level=lvl, n_group=n_sub))
+        }
+      }
+    }
+  }
+  
+  tryCatch(
+    write_csv(panel_data, paste0("Results/Metaanalysis/Meta_DCA_Subgroups_All_", file_suffix, "_Data.csv")),
+    error = function(e) {
+      message("Could not write original CSV, writing to _replot version.")
+      write_csv(panel_data, paste0("Results/Metaanalysis/Meta_DCA_Subgroups_All_", file_suffix, "_Data_replot.csv"))
+    }
+  )
+  
+  layout_keys <- c(
+    "Gender_Male", "Gender_Female", "Aboriginal_Indigenous", "Aboriginal_Non-Indigenous",
+    "HIV_Negative", "HIV_Positive", "HBV_Negative", "HBV_Positive",
+    "Hazardous alcohol use_No", "Hazardous alcohol use_Yes", "Obesity_Not obese (BMI < 30)", "Obesity_Obese (BMI >= 30)"
+  )
+  
+  plot_list_ordered <- map(layout_keys, ~ {
+    if(!is.null(all_plots[[.x]])) all_plots[[.x]] else plot_spacer()
+  })
+  
+  if (length(plot_list_ordered) > 0) {
+    final_panel <- wrap_plots(plot_list_ordered, ncol = 4) + 
+      plot_layout(guides = "collect") & 
+      theme(legend.position = "bottom")
+      
+    ggsave(paste0("Results/Metaanalysis/Meta_DCA_Panel_Subgroups_", file_suffix, ".png"), final_panel, width = 16, height = 12, bg = "white")
+  }
+}
+
+# ------------------------------------------------------------------------------
+# Loading and Running
+# ------------------------------------------------------------------------------
+
+cohort_initial <- read_csv("Data/merged_data.csv", show_col_types = FALSE)
+
+# Rename studies and add metadata
+study_metadata_raw <- tibble(
+  study = c("CEASE", "Defeat", "DARLO-C", "ETHOS Engage", "LiverLife", "Australian PoC Testing Program", "REACH-C", "SHARP-C", "Simplify", "STOP-C", "TEMPO"),
+  new_name = c("CEASE", "D3FEAT", "DARLO-C", "ETHOS Engage", "LiveRLife", "Australian PoC Testing Program", "REACH-C", "SHARP-C", "SIMPLIFY", "SToP-C", "TEMPO"),
+  recruitment = c("2014 to 2017", "2016 to 2017", "2017 to 2018", 
+                  "2018 to 2025", "2014 to 2016", "2022 to 2026", "2016 to 2019", 
+                  "2018 to 2020", "2016", "2014 to 2019", "2022 to 2025")
+)
+
+# Prepare metadata for joining inside functions (keys must match new names)
+study_metadata <- study_metadata_raw %>%
+  transmute(
+    study = ifelse(!is.na(new_name), new_name, study),
+    recruitment
+  )
+
+cohort_initial <- read_csv("Data/merged_data.csv", show_col_types = FALSE) %>%
+  left_join(study_metadata_raw, by = "study") %>%
+  mutate(
+    # Keep original study if no match (though all should match)
+    study = ifelse(!is.na(new_name), new_name, study)
+  )
+
+# Filter for Valid FibroScan
+# Assuming 1 = Valid, 0 = Invalid. NA was filled as 1 in merge step if missing from source.
+n_total <- nrow(cohort_initial)
+n_invalid <- sum(cohort_initial$fibro_valid == 0, na.rm = TRUE)
+n_valid <- sum(cohort_initial$fibro_valid == 1, na.rm = TRUE)
+
+cat("Total Records:", n_total, "\n")
+cat("Invalid FibroScan (Excluded):", n_invalid, "(", percent(n_invalid/n_total), ")\n")
+cat("Valid FibroScan (Retained):", n_valid, "\n")
+
+# Save exclusion stats
+tibble(
+  metric = c("Total Records", "Invalid FibroScan (Excluded)", "Valid FibroScan (Retained)"),
+  count = c(n_total, n_invalid, n_valid),
+  percent = c(100, (n_invalid/n_total)*100, (n_valid/n_total)*100)
+) %>%
+  write_csv("Results/Metaanalysis/Exclusion_Stats_FibroValid.csv")
+
+cohort_raw <- cohort_initial %>%
+  filter(fibro_valid == 1) %>%
+  filter(!is.na(study), !is.na(age), !is.na(fsm)) %>%
+  mutate(study = as.character(study))
+
+# 1. Cirrhosis (FSM >= 12.5)
+cohort_cirrhosis <- cohort_raw %>% mutate(outcome_col = as.integer(fsm >= 12.5))
+run_full_analysis(cohort_cirrhosis, "outcome_col", "fsm >= 12.5", "Cirrhosis")
+
+# 2. CSPH (FSM > 20) as per request "LSM above 20"
+cohort_csph <- cohort_raw %>% mutate(outcome_col = as.integer(fsm > 20))
+run_full_analysis(cohort_csph, "outcome_col", "fsm > 20", "CSPH")
+
+# ------------------------------------------------------------------------------
+# Abstract Figure: Overall DCA (Cirrhosis vs CSPH)
+# ------------------------------------------------------------------------------
+
+make_overall_dca_plot_from_csv <- function(file_suffix, panel_title, x_max = 0.20, y_limits = NULL) {
+  in_file <- paste0("Results/Metaanalysis/Meta_PooledNB_", file_suffix, ".csv")
+  if (!file.exists(in_file)) return(NULL)
+
+  df <- readr::read_csv(in_file, show_col_types = FALSE) %>%
+    filter(is.finite(threshold), threshold <= x_max)
+
+  if (nrow(df) == 0) return(NULL)
+
+  df <- df %>% arrange(strategy, threshold)
+
+  p <- ggplot(df, aes(x = threshold, y = nb_pooled, color = strategy, linetype = strategy, group = strategy)) +
+    geom_smooth(method = "loess", formula = y ~ x, se = FALSE, span = 0.6, linewidth = 1) +
+    coord_cartesian(xlim = c(0, x_max), ylim = y_limits) +
+    scale_x_continuous(
+      breaks = seq(0, x_max, 0.05),
+      labels = scales::percent_format(accuracy = 1)
+    ) +
+    labs(
+      title = panel_title,
+      x = "Threshold probability",
+      y = "Net benefit",
+      color = "Strategy",
+      linetype = "Strategy"
+    ) +
+    scale_color_manual(values = c(
+      "Screen All" = "black",
+      "Screen None" = "black",
+      "Age > 35" = "#1b9e77",
+      "Age > 40" = "#d95f02",
+      "Age > 45" = "#7570b3"
+    )) +
+    scale_linetype_manual(values = c(
+      "Screen All" = "solid",
+      "Screen None" = "dotted",
+      "Age > 35" = "solid",
+      "Age > 40" = "solid",
+      "Age > 45" = "solid"
+    )) +
+  theme_minimal(base_size = 14) +  # Base font size for the whole plot
+  theme(
+    legend.title = element_text(size = 14, face = "bold"),  # Legend title font
+    legend.text  = element_text(size = 14),                 # Legend labels font
+    legend.key.size = unit(1.2, "cm"),                      # Size of legend keys
+    legend.spacing.x = unit(0.5, "cm"),                     # Horizontal spacing
+    legend.spacing.y = unit(0.3, "cm")                      # Vertical spacing
+  ) +
+    guides(fill = guide_legend(nrow=2, byrow=TRUE))
+
+  p
+}
+
+abstract_xmax <- 0.20
+abstract_ymin <- -0.01
+abstract_ymax <- 0.1
+
+cirr_df <- readr::read_csv("Results/Metaanalysis/Meta_PooledNB_Cirrhosis.csv", show_col_types = FALSE) %>%
+  filter(is.finite(threshold), threshold <= abstract_xmax)
+
+csph_df <- readr::read_csv("Results/Metaanalysis/Meta_PooledNB_CSPH.csv", show_col_types = FALSE) %>%
+  filter(is.finite(threshold), threshold <= abstract_xmax)
+
+#abstract_ymin <- min(c(0, cirr_df$nb_pooled, csph_df$nb_pooled), na.rm = TRUE)
+#abstract_ymax <- max(c(0, cirr_df$nb_pooled, csph_df$nb_pooled), na.rm = TRUE)
+abstract_ylim <- c(min(-0.01, abstract_ymin), max(0.1, abstract_ymax * 1.05))
+
+p_abs_a <- make_overall_dca_plot_from_csv(
+  file_suffix = "Cirrhosis",
+  panel_title = "A. Cirrhosis\n(LSM >= 12.5 kPa)",
+  x_max = abstract_xmax,
+  y_limits = abstract_ylim
+)
+
+p_abs_b <- make_overall_dca_plot_from_csv(
+  file_suffix = "CSPH",
+  panel_title = "B. Clinically significant\nportal hypertension (LSM > 20 kPa)",
+  x_max = abstract_xmax,
+  y_limits = abstract_ylim
+)
+
+if (!is.null(p_abs_a) && !is.null(p_abs_b)) {
+  p_abs <- (p_abs_a + p_abs_b) +
+    plot_layout(guides = "collect") &
+    theme(legend.position = "bottom")
+
+  ggsave(
+    filename = "Results/Metaanalysis/Figure_Abstract_MetaDCA_Overall_Cirrhosis_vs_CSPH.png",
+    plot = p_abs,
+    width = 12,
+    height = 5.5,
+    dpi = 300,
+    bg = "white"
+  )
+}
+
+# Two-panel figure: Meta-analysis NIA (Cirrhosis vs CSPH)
+
+```{r}
+pacman::p_load(dplyr, ggplot2, readr, patchwork, scales)
+
+make_nia_plot_from_csv <- function(file_path, panel_title, x_max = 0.30, y_limits = c(0, 50)) {
+  if (!file.exists(file_path)) return(NULL)
+
+  df <- readr::read_csv(file_path, show_col_types = FALSE) %>%
+    filter(is.finite(threshold), threshold <= x_max)
+
+  # Keep figure consistent with the label "positive values only"
+  df <- df %>%
+    mutate(nia_per_100 = pmax(0, nia_per_100))
+
+  if (nrow(df) == 0) return(NULL)
+
+  df <- df %>%
+    mutate(strategy = factor(strategy, levels = c("Age > 35", "Age > 40", "Age > 45")))
+
+  ggplot(df, aes(x = threshold, y = nia_per_100, color = strategy, group = strategy)) +
+    geom_hline(aes(yintercept = 0, color = "Screen All"), linetype = "dashed", linewidth = 1) +
+    geom_smooth(method = "loess", formula = y ~ x, se = FALSE, span = 0.6, linewidth = 1.2) +
+    coord_cartesian(ylim = y_limits) +
+    scale_x_continuous(
+      breaks = seq(0, x_max, 0.05),
+      labels = scales::percent_format(accuracy = 1)
+    ) +
+    labs(
+      title = panel_title,
+      x = "Threshold probability",
+      y = "Net interventions avoided per 100",
+      color = NULL
+    ) +
+    scale_color_manual(values = c(
+      "Age > 35" = "#1b9e77",
+      "Age > 40" = "#d95f02",
+      "Age > 45" = "#7570b3",
+      "Screen All" = "black"
+    )) +
+    theme_minimal(base_size = 20) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      plot.margin = margin(t = 12, r = 18, b = 8, l = 8),
+      legend.position = "bottom",
+      legend.text = element_text(size = 18),
+      axis.title = element_text(size = 18),
+      axis.text = element_text(size = 16)
+    )
+}
+
+nia_a <- make_nia_plot_from_csv(
+  file_path = "Results/Metaanalysis/Meta_NIA_Cirrhosis_Data.csv",
+  panel_title = "A. Cirrhosis (LSM >=12.5)",
+  x_max = 0.30,
+  y_limits = c(0, 50)
+)
+
+nia_b <- make_nia_plot_from_csv(
+  file_path = "Results/Metaanalysis/Meta_NIA_CSPH_Data.csv",
+  panel_title = "B. Clinically significant portal hypertension\n(LSM >20)",
+  x_max = 0.30,
+  y_limits = c(0, 50)
+)
+
+if (!is.null(nia_a) && !is.null(nia_b)) {
+  nia_panel <- (nia_a + nia_b) +
+    plot_layout(guides = "collect") &
+    theme(legend.position = "bottom")
+
+  ggsave(
+    filename = "Results/Metaanalysis/Figure_Abstract_MetaNIA_Cirrhosis_vs_CSPH.png",
+    plot = nia_panel,
+    width = 16,
+    height = 6,
+    dpi = 300,
+    bg = "white"
+  )
+}
+```
+```

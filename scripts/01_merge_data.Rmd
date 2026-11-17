@@ -1,0 +1,476 @@
+---
+title: "Merge All Datasets"
+output:
+  html_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+pacman::p_load(tidyverse, janitor, DiagrammeR, glue)
+# library(DiagrammeR) # Optional
+# library(DiagrammeRsvg) # Optional
+# library(rsvg) # Optional
+
+
+```
+
+# Load Data
+
+```{r}
+# Helper function to read csv if it exists
+read_data <- function(path, study_name) {
+  if (file.exists(path)) {
+    message(paste("Reading", study_name))
+    df <- read_csv(path, show_col_types = FALSE) %>%
+      mutate(study = study_name)
+    return(df)
+  } else {
+    warning(paste("File not found:", path))
+    return(NULL)
+  }
+}
+
+# The harmonized ETHOS and REACH files created by previous script
+if(file.exists("Data/ethos_harmonized.csv")) {
+  df_ethos_raw <- read_data("Data/ethos_harmonized.csv", "ETHOS Engage") %>%
+    rename(atsi = ethnic_label)
+} else {
+  df_ethos_raw <- read_data("Data/ethos.csv", "ETHOS Engage") %>%
+    rename(atsi = ethnic_label)
+}
+
+if(file.exists("Data/reach_harmonized.csv")) {
+  df_reach_raw <- read_data("Data/reach_harmonized.csv", "REACH-C") %>%
+    rename(atsi = ethnic_label)
+} else {
+  df_reach_raw <- read_data("Data/reach.csv", "REACH-C") %>%
+    rename(atsi = ethnic_label)
+}
+
+df_defeat_raw   <- read_data("Data/defeat.csv", "Defeat")
+df_simplify_raw <- read_data("Data/simplify.csv", "Simplify")
+df_sharp_c_raw  <- read_data("Data/sharp_c.csv", "SHARP-C")
+df_stop_c_raw   <- read_data("Data/stop_c.csv", "STOP-C")
+df_cease_raw    <- read_data("Data/cease.csv", "CEASE")
+df_darlo_raw    <- read_data("Data/darlo.csv", "DARLO-C")
+df_liverlife_raw <- read_data("Data/liverlife.csv", "LiverLife") %>%
+  rename(gender = gender0)
+df_scalec_raw   <- read_data("Data/scalec.csv", "Scale-C")
+df_poct_raw     <- read_data("Data/poct.csv", "Australian PoC Testing Program")
+df_tempo_rct_raw <- read_data("Data/tempo_rct.csv", "TEMPO")
+# df_tempo_pilot_raw <- read_data("Data/tempo_test_treat.csv", "TEMPO-Pilot")
+df_reach_raw <- df_reach_raw %>%
+  mutate(fibro_valid = if_else(is.na(fsm), 0, 1)) # Use hcv_rna for HCV status in REACH-C
+```
+
+# Standardization Functions
+
+```{r}
+standardize_cols <- function(df) {
+  
+  # Ensure character type for study to avoid errors if missing
+  if(!"study" %in% names(df)) df$study <- NA_character_
+  
+  # Define a safe getter that doesn't crash if the column is missing
+  get_col <- function(data, candidates) {
+    for (col in candidates) {
+      if (col %in% names(data)) {
+        return(as.character(data[[col]]))
+      }
+    }
+    return(rep(NA_character_, nrow(data)))
+  }
+  
+  df %>%
+    mutate(
+      # ID
+      id = get_col(., c("subject_id", "recid", "individual")),
+      
+      # Demographics
+      age = get_col(., c("age", "Age", "AGE")),
+      gender = get_col(., c("gender", "sex", "Gender", "Sex", "GENDER", "SEX", "gender0")),
+
+      # Ethnicity (International)
+      ethnicity = get_col(., c("ethnic_label", "ethnicity")),
+      
+      # Aboriginal Status (Australian)
+      aboriginal = get_col(., c("atsi", "atsi2", "indigenous", "aboriginal", "tsi", "atsistatus")),
+      
+      # HIV
+      hiv = get_col(., c("hiv", "hiv_ab_label", "hiv_ab", "schiv")),
+      
+      # HCV
+      hcv = get_col(., c("hcv", "HCV", "hcv_rna", "hcv_status")),
+      
+      # HBV
+      hbv = get_col(., c("hbv", "hbv_sag_label")),
+      
+      # Alcohol
+      alcohol_frequency = get_col(., c("alcohol_frequency", "dafc")),
+      alcohol_amount = get_col(., c("alcohol_drinks_day", "dadtd")),
+      alcohol_binge = get_col(., c("alcohol_binge", "alcohol_bingre_frequency", "bingre", "dabf")),
+      
+      # Labs (Ensure existence)
+      alt = get_col(., c("alt", "ALT")),
+      ast = get_col(., c("ast", "AST")),
+      platelets = get_col(., c("platelets", "plts", "PLATELETS")),
+      albumin = get_col(., c("albumin", "alb", "ALB")),
+      creatinine = get_col(., c("creatinine", "creat", "CREAT")),
+      
+      # Anthropometrics (Ensure existence)
+      height = get_col(., c("height", "hgt")),
+      weight = get_col(., c("weight", "wgt")),
+      bmi = get_col(., c("bmi", "BMI")),
+      
+      # FibroScan Validity
+      fibro_valid = get_col(., c("fibro_valid", "valid_scan", "validity", "valid"))
+    ) %>%
+    select(
+      study,
+      id, # Select the standardized ID column we just created
+      
+      any_of(c("age", "gender", "ethnicity", "aboriginal", "hiv", "hcv", "hbv")),
+      
+      # Liver
+      any_of(c("fsm", "fibro_valid")), 
+      
+      # Labs
+      alt, ast, platelets, albumin, creatinine,
+      
+      # Anthropometrics
+      height, weight, bmi,
+      
+      # Alcohol
+      any_of(c("alcohol_frequency", "alcohol_amount", "alcohol_binge"))
+    )
+}
+
+parse_binary01 <- function(x) {
+  x_chr <- tolower(trimws(as.character(x)))
+  dplyr::case_when(
+    is.na(x_chr) | x_chr == "" ~ NA_real_,
+    x_chr %in% c("1", "yes", "y", "true", "t", "valid") ~ 1,
+    x_chr %in% c("0", "no", "n", "false", "f", "invalid") ~ 0,
+    !is.na(suppressWarnings(as.numeric(x_chr))) ~ suppressWarnings(as.numeric(x_chr)),
+    TRUE ~ NA_real_
+  )
+}
+
+process_study <- function(df, study_name) {
+  if (is.null(df)) return(NULL)
+
+  restricted_aboriginal_studies <- c("CEASE", "DARLO-C", "Defeat", "Simplify")
+  
+  # Step 1: Initial Count
+  n_total <- nrow(df)
+  
+  # Prepare variables
+  df_proc <- df %>%
+    standardize_cols()
+    
+  df_clean <- df_proc %>%
+    mutate(
+      # Ensure numeric types
+      age = as.numeric(age),
+      fsm = as.numeric(fsm),
+      fibro_valid = parse_binary01(fibro_valid),
+      across(any_of(c("alt", "ast", "albumin", "creatinine", "platelets", "height", "weight", "bmi")), as.numeric),
+      
+      # Normalize Gender strings
+      gender = case_when(
+        is.na(gender) | stringr::str_trim(as.character(gender)) == "" ~ NA_character_,
+        str_detect(gender, "(?i)female|woman|^2$") ~ "Female",
+        str_detect(gender, "(?i)male|man|^1$") ~ "Male",
+        str_detect(gender, "(?i)trans|^3$") ~ "Transgender",
+        TRUE ~ "Other/Unknown"
+      ),
+      
+      # Normalize Aboriginal Status
+      aboriginal = case_when(
+        str_detect(aboriginal, "(?i)aboriginal|indigenous|tsi|first nations|koori|murri|yes|pos|^1$") ~ "Indigenous",
+        str_detect(aboriginal, "(?i)non|no|neg|^0$|^2$") ~ "Non-Indigenous", 
+        TRUE ~ NA_character_
+      ),
+      aboriginal = if_else(study %in% restricted_aboriginal_studies, NA_character_, aboriginal),
+      
+      # Normalize HIV strings
+      hiv = case_when(
+        str_detect(hiv, "(?i)pos|yes|reactive|1") ~ "Positive",
+        str_detect(hiv, "(?i)neg|no|non|0") ~ "Negative",
+        TRUE ~ NA_character_
+      ),
+      
+      # HCV (Ensure numeric 1/0 for filtering)
+      # If missing, assume 0 (not HCV/unknown)? The instruction says "include those that are 1".
+      # We will rely on explicit 1 for inclusion.
+      hcv = suppressWarnings(as.numeric(hcv)),
+      
+      # Normalize HBV strings
+      hbv = case_when(
+        str_detect(hbv, "(?i)pos|yes|reactive") ~ "Positive",
+        str_detect(hbv, "(?i)neg|no|non") ~ "Negative",
+        TRUE ~ NA_character_
+      ),
+      
+      # Metavir Categories
+      metavir = case_when(
+        fsm >= 12.5 ~ "≥12.5 kPa",
+        fsm >= 10.0 ~ "10.0–12.49 kPa",
+        fsm >= 7.1  ~ "7.1–9.99 kPa",
+        fsm < 7.1   ~ "<7.1 kPa",
+        TRUE ~ NA_character_
+        ),
+      metavir = factor(
+      metavir,
+      levels = c("<7.1 kPa", "7.1–9.99 kPa", "10.0–12.49 kPa", "≥12.5 kPa"),
+      ordered = TRUE
+    ),
+      
+      # High Baseline Stiffness (>=20 kPa)
+      fsm_20 = if_else(fsm > 20, 1, 0),
+      
+      # Fibro Valid (Fill NA with 1 - assumed valid if not specified)
+      #fibro_valid = replace_na(as.numeric(fibro_valid), 1),
+      
+      # APRI
+      apri = (ast / 40) / (platelets / 100),
+      apri_cat = case_when(
+        apri > 2.0 ~ ">2.0",
+        apri > 1.0 ~ "1.0-2.0",
+        apri <= 1.0 ~ "<=1.0",
+        TRUE ~ NA_character_
+      ),
+      
+      # FIB-4
+      fib4 = (age * ast) / (platelets * sqrt(alt)),
+      fib4_cat = case_when(
+        fib4 > 3.25 ~ ">3.25",
+        fib4 >= 1.45 ~ "1.45-3.25",
+        fib4 < 1.45 ~ "<1.45",
+        TRUE ~ NA_character_
+      ),
+      
+      # Alcohol Normalization
+      alcohol_binge_cat = case_when(
+        str_detect(alcohol_binge, "(?i)daily|day|4|5|almost|5") ~ "Daily or almost daily",
+        str_detect(alcohol_binge, "(?i)week|2.*3.*week|4") ~ "Weekly",
+        str_detect(alcohol_binge, "(?i)less.*month|month.*less|2") ~ "Less than monthly",
+        str_detect(alcohol_binge, "(?i)^monthly|month|2.*4.*month|3") ~ "Monthly",
+        str_detect(alcohol_binge, "(?i)^never|no|none|1") ~ "Never",
+        TRUE ~ NA_character_
+      ),
+      alcohol_frequency_cat = case_when(
+        str_detect(alcohol_frequency, "(?i)4.*more.*week|^5") ~ "4 or more times a week",
+        str_detect(alcohol_frequency, "(?i)2.*3.*week|^4$") ~ "2 to 3 times a week",
+        str_detect(alcohol_frequency, "(?i)2.*4.*month|^3$") ~ "2 to 4 times a month",
+        str_detect(alcohol_frequency, "(?i)monthly.*less|less.*monthly|^2$") ~ "Monthly or less",
+        str_detect(alcohol_frequency, "(?i)^never|no|none|^1$") ~ "Never",
+        TRUE ~ NA_character_
+      ),
+      alcohol_amount_cat = case_when(
+        str_detect(alcohol_amount, "(?i)10.*more|^5$") ~ "10 or more",
+        str_detect(alcohol_amount, "(?i)7.*9|^4$") ~ "7 to 9",
+        str_detect(alcohol_amount, "(?i)5.*6|^3$") ~ "5 or 6",
+        str_detect(alcohol_amount, "(?i)3.*4|^2$") ~ "3 or 4",
+        str_detect(alcohol_amount, "(?i)1.*2|^1$") ~ "1 or 2",
+        TRUE ~ NA_character_
+      ),
+      
+      # AUDIT-C
+      audit_freq_score = as.numeric(factor(alcohol_frequency_cat, levels = c("Never", "Monthly or less", "2 to 4 times a month", "2 to 3 times a week", "4 or more times a week"))) - 1,
+      audit_amount_score = as.numeric(factor(alcohol_amount_cat, levels = c("1 or 2", "3 or 4", "5 or 6", "7 to 9", "10 or more"))) - 1,
+      audit_binge_score = as.numeric(factor(alcohol_binge_cat, levels = c("Never", "Less than monthly", "Monthly", "Weekly", "Daily or almost daily"))) - 1,
+      
+      audit_amount_score = if_else(!is.na(audit_freq_score) & audit_freq_score == 0 & is.na(audit_amount_score), 0, audit_amount_score),
+      audit_binge_score = if_else(!is.na(audit_freq_score) & audit_freq_score == 0 & is.na(audit_binge_score), 0, audit_binge_score),
+      audit_c_score = audit_freq_score + audit_amount_score + audit_binge_score
+    ) %>%
+    select(
+      study, id, 
+      age, gender, ethnicity, aboriginal,
+      hiv, hbv, hcv,
+      fsm, metavir, fsm_20, fibro_valid,
+      fib4, fib4_cat, apri, apri_cat,
+      alcohol_frequency_cat, alcohol_amount_cat, alcohol_binge_cat, audit_c_score,
+      alt, ast, platelets, albumin, creatinine,
+      height, weight, bmi
+    )
+    
+  # --- FILTER FLOW & DIAGRAM ---
+  
+  # MARKING instead of filtering
+  df_final <- df_clean %>%
+    mutate(
+      excluded_hcv = is.na(hcv) | hcv != 1,
+      excluded_missing_fsm = !excluded_hcv & is.na(fsm),
+      # If we can't confirm validity (fibro_valid is NA), exclude.
+      excluded_invalid_fsm = !excluded_hcv & !excluded_missing_fsm & (is.na(fibro_valid) | fibro_valid != 1),
+      included_step1 = !excluded_hcv & !excluded_missing_fsm & !excluded_invalid_fsm,
+      excluded_missing_age = included_step1 & is.na(age),
+      included_step2 = included_step1 & !excluded_missing_age
+    )
+
+  # 1. HCV Filter
+  n_hcv_excluded <- sum(df_final$excluded_hcv)
+  n_hcv_kept <- sum(!df_final$excluded_hcv)
+  
+  # 2. Missing FibroScan Filter
+  n_fsm_excluded <- sum(df_final$excluded_missing_fsm)
+  n_fsm_kept <- sum(!df_final$excluded_hcv & !df_final$excluded_missing_fsm)
+  
+  # 3. Invalid FibroScan Filter
+  n_valid_excluded <- sum(df_final$excluded_invalid_fsm, na.rm = TRUE)
+  
+  # 4. Missing age (final analysis cohort)
+  n_age_excluded <- sum(df_final$excluded_missing_age, na.rm = TRUE)
+  n_final_count <- sum(df_final$included_step2, na.rm = TRUE)
+  
+  # Generate Flow Diagram
+  if (n_total > 0) {
+    # DiagrammeR GraphViz
+    # Using simple boxes
+    diagram_code <- glue::glue("
+      digraph flow {{
+        graph [layout = dot, rankdir = TB]
+        node [shape = box, style = filled, fillcolor = white]
+        
+        tab1 [label = 'Total Records\\n(n = {n_total})']
+        tab2 [label = 'HCV Not Detected / Missing\\n(n = {n_hcv_excluded})', fillcolor = '#ffcccc']
+        tab3 [label = 'HCV Detected\\n(n = {n_hcv_kept})']
+        tab4 [label = 'Missing FibroScan\\n(n = {n_fsm_excluded})', fillcolor = '#ffcccc']
+        tab5 [label = 'FibroScan Available\\n(n = {n_fsm_kept})']
+        tab6 [label = 'Invalid FibroScan\\n(n = {n_valid_excluded})', fillcolor = '#ffcccc']
+        tab7 [label = 'Valid Analysis Population\\n(n = {n_final_count})', fillcolor = '#ccffcc']
+        
+        tab1 -> tab3
+        tab1 -> tab2 [style=dotted]
+        tab3 -> tab5
+        tab3 -> tab4 [style=dotted]
+        tab5 -> tab7
+        tab5 -> tab6 [style=dotted]
+      }}
+    ")
+    
+    DiagrammeR::grViz(diagram_code)
+    
+    # Save diagram source
+    dir.create("Results/Descriptives", recursive = TRUE, showWarnings = FALSE)
+    dir.create("Results/FlowDiagrams", recursive = TRUE, showWarnings = FALSE)
+    file_name_dot <- paste0("Results/FlowDiagrams/Flow_", gsub('[^A-Za-z0-9]', '_', study_name), ".dot")
+    cat(diagram_code, file = file_name_dot)
+    
+    # Save stats
+    stats_df <- tibble(
+      Study = study_name,
+      Total = n_total,
+      Excluded_HCV = n_hcv_excluded,
+      Kept_HCV = n_hcv_kept,
+      Excluded_MissingFSM = n_fsm_excluded,
+      Kept_HasFSM = n_fsm_kept,
+      Excluded_InvalidFSM = n_valid_excluded,
+      Excluded_MissingAge = n_age_excluded,
+      Final_Analysis = n_final_count
+    )
+    
+    stats_file <- "Results/Descriptives/Study_Flow_Counts.csv"
+    write_csv(stats_df, stats_file, append = file.exists(stats_file))
+  }
+  
+  return(df_final)
+  return(diagram_code)
+}
+
+df_darlo_raw <- df_darlo_raw %>%
+  mutate(
+    age = as.numeric(difftime(date_enrolled, date_birth, units = "days")) / 365.25
+  )
+
+```
+
+# Process and Merge
+
+```{r}
+# Clear the flow counts file before starting
+if (file.exists("Results/Descriptives/Study_Flow_Counts.csv")) {
+  file.remove("Results/Descriptives/Study_Flow_Counts.csv")
+}
+
+# Apply
+clean_ethos    <- process_study(df_ethos_raw, "ETHOS Engage")
+clean_reach    <- process_study(df_reach_raw, "REACH-C")
+clean_defeat   <- process_study(df_defeat_raw, "Defeat")
+clean_simplify <- process_study(df_simplify_raw, "Simplify")
+clean_sharp_c  <- process_study(df_sharp_c_raw, "SHARP-C")
+clean_stop_c   <- process_study(df_stop_c_raw, "STOP-C")
+clean_cease    <- process_study(df_cease_raw, "CEASE")
+clean_darlo    <- process_study(df_darlo_raw, "DARLO-C")
+clean_liverlife <- process_study(df_liverlife_raw, "LiverLife")
+clean_scalec   <- process_study(df_scalec_raw, "Scale-C")
+clean_poct     <- process_study(df_poct_raw, "Australian PoC Testing Program")
+clean_tempo_rct <- process_study(df_tempo_rct_raw, "TEMPO")
+# clean_tempo_pilot <- process_study(df_tempo_pilot_raw, "TEMPO-Pilot")
+
+# Merge
+df_final <- bind_rows(
+  clean_ethos,
+  clean_reach,
+  clean_defeat,
+  clean_simplify,
+  clean_sharp_c,
+  clean_stop_c,
+  clean_cease,
+  clean_darlo,
+  clean_liverlife,
+  clean_scalec,
+  clean_poct,
+  clean_tempo_rct#,
+  # clean_tempo_pilot
+)
+```
+
+```{r}
+#Create hazardous alcohol use variable based on AUDIT-C score
+df_final <- df_final %>%
+  mutate(
+    hazardous_alcohol_use = case_when(
+      is.na(audit_c_score) ~ NA_character_,
+      is.na(gender) ~ NA_character_,
+      gender == "Male" & audit_c_score >= 4 ~ "Yes",
+      gender == "Female" & audit_c_score >= 3 ~ "Yes",
+      gender == "Transgender" & audit_c_score >= 3 ~ "Yes", # Using
+      TRUE ~ "No"
+    )
+  )
+```
+
+```{r}
+df_final %>% count(study)
+```
+
+# Export
+
+```{r}
+# Show exclusion table
+if (file.exists("Results/Descriptives/Study_Flow_Counts.csv")) {
+  flow_counts <- read_csv("Results/Descriptives/Study_Flow_Counts.csv", show_col_types = FALSE)
+  knitr::kable(flow_counts, caption = "Participant Exclusion Table by Study")
+}
+
+# Export
+write_csv(df_final, "Data/merged_data_all.csv")
+print(paste("Full merged file (all participants) saved to:", file.path(getwd(), "Data/merged_data_all.csv")))
+
+# Filter for legacy compatibility (Only Included)
+df_final_clean <- df_final %>%
+  filter(included_step2) %>%
+  select(-excluded_hcv, -excluded_missing_fsm, -excluded_invalid_fsm, -excluded_missing_age, -included_step1, -included_step2)
+
+write_csv(df_final_clean, "Data/merged_data.csv")
+print(paste("Filtered merged file (analysis cohort) saved to:", file.path(getwd(), "Data/merged_data.csv")))
+```
+
+
+
+

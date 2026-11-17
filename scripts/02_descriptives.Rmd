@@ -1,0 +1,848 @@
+```{r}
+library(pacman)
+dir.create("Results/Descriptives", recursive = TRUE, showWarnings = FALSE)
+p_load(tidyverse, tidylog, gtsummary, gt, officer, colorspace, tidyr, readr, scales, stringr, ggrepel)
+
+gtsummary::theme_gtsummary_compact()
+```
+
+```{r}
+# Load data
+df_all <- read_csv("Data/merged_data_all.csv", show_col_types = FALSE) 
+
+df_all <- df_all %>%
+  mutate(
+    hcv = replace_na(hcv, 0)
+  ) %>%
+  mutate(
+    # Use the inclusion/exclusion flow flags from 01_merge_data when available
+    included = if ("included_step1" %in% names(.)) coalesce(included_step1, FALSE) & !is.na(age) else (hcv == 1) & !is.na(fsm) & !is.na(age),
+    cohort = if_else(included, "Included", "Excluded")
+  ) %>%
+  mutate(
+      haz_alc = case_when(
+      audit_c_score >= 4 & str_to_lower(gender) == "male" ~ "Hazardous (AUDIT-C)",
+      audit_c_score >= 3 & str_to_lower(gender) != "male" ~ "Hazardous (AUDIT-C)",
+      is.na(audit_c_score) ~ NA_character_,
+      TRUE ~ "Not hazardous"
+    ),
+    obesity = case_when(
+      is.na(bmi) ~ NA_character_,
+      bmi >= 30 ~ "Obese (BMI ≥ 30)",
+      bmi < 30 ~ "Not obese (BMI < 30)"
+    ),
+    aboriginal = if_else(
+      aboriginal == "Indigenous", 1, 0
+      )
+  )
+
+#Change names of studies
+df_all <- df_all %>%
+  mutate(
+    study = case_when(
+      study == "Simplify" ~ "SIMPLIFY",
+      study == "Defeat" ~ "D3FEAT",
+      study == "LiverLife" ~ "LIVERLIFE",
+      study == "ETHOS" ~ "ETHOS Engage",
+      study == "DARLO" ~ "DARLO-C",
+      study == "POCT" ~ "Australian PoC Testing Program",
+      study == "TEMPO-RCT" ~ "TEMPO",
+      TRUE ~ study
+    )
+  )
+
+#Total number of cases
+df_all %>% count(study)
+
+#Create inclusion/exclusion datasets
+df_final <- df_all %>%
+  filter(included)
+
+df_excluded <- df_all %>%
+  filter(!included)
+
+#Sanity checks
+df_all %>%
+  count(cohort) %>%
+  mutate(prop = n / sum(n)) %>%
+  print()
+
+df_final %>%
+  count(cirrhosis = fsm >= 12.5) %>%
+  mutate(prop = n / sum(n)) %>%
+  print()
+
+df_final %>%
+  count(hcv)
+
+df_final %>%
+  count(fibro_valid)
+
+df_all %>%
+  group_by(study) %>%
+  count(hcv)
+
+df_all %>%
+  filter(hcv == 1) %>%
+  group_by(study) %>%
+  count(is.na(fsm))
+
+df_all %>%
+  filter(hcv == 1) %>%
+  group_by(study) %>%
+  count(fibro_valid)
+
+# Age-stratified prevalence (included cohort)
+
+```{r}
+# Use the *included analytic cohort* (df_final) so denominators match Table 1
+stopifnot(exists("df_final"))
+
+age_bin_prev <- df_final %>%
+  filter(!is.na(age), !is.na(fsm)) %>%
+  mutate(
+    age_bin = cut(
+      age,
+      breaks = c(-Inf, 35, 40, 45, Inf),
+      right = FALSE,
+      labels = c("<35", "35-39", "40-44", "45+")
+    ),
+    fsm_12_5 = fsm >= 12.5,
+    fsm_20 = fsm > 20
+  ) %>%
+  group_by(age_bin) %>%
+  summarise(
+    n_cohort = n(),
+    n_fsm_12_5 = sum(fsm_12_5),
+    prev_fsm_12_5 = mean(fsm_12_5),
+    n_fsm_20 = sum(fsm_20),
+    prev_fsm_20 = mean(fsm_20),
+    .groups = "drop"
+  )
+
+age_bin_prev
+
+write_csv(age_bin_prev, "Results/Descriptives/Cohort_Prevalence_byAgeBin_included.csv")
+
+cat(
+  "Included cohort with non-missing age+FSM:",
+  sum(age_bin_prev$n_cohort),
+  "\n"
+)
+```
+```
+
+# Summary study level
+
+```{r}
+df_study <- read_csv("Data/study_data.csv")
+
+# unweighted table = number of studies
+tbl_studies <- df_study %>%
+  select(
+    `Study location` = study_location,
+    `Study design` = study_design,
+    `Included sample size` = sample_group,
+    `Population included` = population_group
+  ) %>%
+  tbl_summary(
+    missing = "no",
+    statistic = all_categorical() ~ "{n} ({p}%)",
+    digits = all_categorical() ~ c(0, 0),
+    sort = list(
+      `Study location` ~ "frequency",
+      `Study design` ~ "frequency",
+      `Included sample size` ~ "frequency",
+      `Population included` ~ "frequency"
+    )
+  )
+
+tbl_studies
+
+```
+
+# Summary Patient level
+
+```{r}
+# Print Summary by study
+tbl.1 <- df_final %>% 
+  select(-id) %>% 
+  select(
+    Study = study,
+    Age = age,
+    Gender = gender,
+    #Ethnicity = ethnicity,
+    `Identified as Aboriginal and/or Torres Strait Islander` = aboriginal,
+    #Height = height,
+    #Weight = weight,
+    `BMI, median (IQR)` = bmi,
+    `Obesity (BMI ≥ 30)` = obesity,
+    #`Alcohol frequency` = alcohol_frequency_cat,
+    #`Alcohol amount` = alcohol_amount_cat,
+    #`Alcohol binge frequency` = alcohol_binge_cat,
+    `AUDIT-C score` = audit_c_score,
+    `Hazardous alcohol use` = haz_alc,
+    HIV = hiv,
+    HBV = hbv,
+    `Median liver stiffness (kPa)` = fsm,
+    `Liver stiffness measurement (Metavir category)` = metavir,
+    `CSPH (>20 kPa)` = fsm_20
+    #`FIB-4 score` = fib4,
+    #`FIB-4 category` = fib4_cat,
+    #`APRI score` = apri,
+    #`APRI category` = apri_cat,
+    #ALT = alt,
+    #AST = ast,
+    #Platelets = platelets,
+    #Albumin = albumin,
+    #Creatinine = creatinine
+  ) %>%
+  tbl_summary(
+    by = Study,
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = list(
+      all_continuous() ~ 1,
+      all_categorical() ~ c(0, 1)
+    ),
+    sort = list(
+      `Gender` ~ "frequency",
+      `Liver stiffness measurement (Metavir category)` ~ "frequency"),
+    missing = "ifany"
+  ) %>%
+  modify_table_body(
+    ~ .x %>%
+      mutate(across(starts_with("stat_"), ~ str_replace_all(., "NA \\(NA, NA\\)", "NA") %>% str_replace_all("0 \\(NA%\\)", "NA")))
+  )   %>%
+  modify_footnote(
+    everything() ~
+  "Abbreviations: AUDIT-C = Alcohol Use Disorders Identification Test-Consumption; BMI = body mass index; CSPH = clinically significant portal hypertension; HBV = hepatitis B virus; HCV = hepatitis C virus; HIV = human immunodeficiency virus; kPa = kilopascals; NA = not available. Data are presented as median (Q1, Q3) or n (%).")
+
+
+tbl.1
+
+#Overall
+
+tbl.2 <- df_final %>%
+  select(-id) %>%
+  select(
+    Age = age,
+    Gender = gender,
+    #Ethnicity = ethnicity,
+    `Identified as Aboriginal and/or Torres Strait Islander` = aboriginal,
+    #Height = height,
+    #Weight = weight,
+    `BMI, median (IQR)` = bmi,
+    `Obesity (BMI ≥ 30)` = obesity,
+    #`Alcohol frequency` = alcohol_frequency_cat,
+    #`Alcohol amount` = alcohol_amount_cat,
+    #`Alcohol binge frequency` = alcohol_binge_cat,
+    `AUDIT-C score` = audit_c_score,
+    `Hazardous alcohol use` = haz_alc,
+    HIV = hiv,
+    HBV = hbv,
+    `Median liver stiffness (kPa)` = fsm,
+    `Liver stiffness measurement (Metavir category)` = metavir,
+    `CSPH (>20 kPa)` = fsm_20
+    #`FIB-4 score` = fib4,
+    #`FIB-4 category` = fib4_cat,
+    #`APRI score` = apri,
+    #`APRI category` = apri_cat,
+    #ALT = alt,
+    #AST = ast,
+    #Platelets = platelets,
+    #Albumin = albumin,
+    #Creatinine = creatinine
+  ) %>%
+  tbl_summary(
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = list(
+      all_continuous() ~ 1,
+      all_categorical() ~ c(0, 1)
+    ),
+    sort = list(
+      `Gender` ~ "frequency",
+      `Liver stiffness measurement (Metavir category)` ~ "frequency"),
+    missing = "ifany"
+  ) %>%
+  modify_table_body(
+    ~ .x %>%
+      mutate(across(starts_with("stat_"), ~ str_replace_all(., "NA \\(NA, NA\\)", "NA") %>% str_replace_all("0 \\(NA%\\)", "NA")))
+  )
+
+tbl.2
+
+#Merge study level and IPD tables
+tbl.2.stack <- tbl_stack(list(tbl_studies, tbl.2), group_header = c("Study-level", "Individual participant data-level")) %>%
+  modify_footnote(
+    everything() ~
+  "Abbreviations: AUDIT-C = Alcohol Use Disorders Identification Test-Consumption; BMI = body mass index; CSPH = clinically significant portal hypertension; HBV = hepatitis B virus; HCV = hepatitis C virus; HIV = human immunodeficiency virus; kPa = kilopascals; NA = not available. Data are presented as median (Q1, Q3) or n (%).")
+
+tbl.2.stack 
+
+#Save to word
+p_load(gtregression)
+save_docx(tables = lapply(list(tbl.2.stack, tbl.1), gtsummary::as_flex_table), filename = "Results/Descriptives/Table_1_overall.docx")
+
+```
+
+```{r}
+tbl.cirrhosis <- df_final %>%
+  select(-id) %>%
+  mutate(
+    Cirrhosis = case_when(
+      fsm >= 12.5 ~ "Cirrhosis (LSM >= 12.5 kPa)",
+      fsm < 12.5 ~ "No cirrhosis (LSM < 12.5 kPa)",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(
+    #Study = study,
+    `Age, median (IQR)` = age,
+    Gender = gender,
+    #Ethnicity = ethnicity,
+    Aboriginal = aboriginal,
+    #Height = height,
+    #Weight = weight,
+    `BMI, median (IQR)` = bmi,
+    `Obesity (BMI ≥ 30)` = obesity,
+    #`Alcohol frequency` = alcohol_frequency_cat,
+    #`Alcohol amount` = alcohol_amount_cat,
+    #`Alcohol binge frequency` = alcohol_binge_cat,
+    `AUDIT-C score` = audit_c_score,
+    `Hazardous alcohol use` = haz_alc,
+    HIV = hiv,
+    HBV = hbv,
+    Cirrhosis
+    #`FIB-4 score` = fib4,
+    #`FIB-4 category` = fib4_cat,
+    #`APRI score` = apri,
+    #`APRI category` = apri_cat,
+    #ALT = alt,
+    #AST = ast,
+    #Platelets = platelets,
+    #Albumin = albumin,
+    #Creatinine = creatinine
+  ) %>%
+  tbl_summary(
+    by = "Cirrhosis",
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = list(
+      all_continuous() ~ 1,
+      all_categorical() ~ c(0, 1)
+    ),
+    sort = list(
+      `Gender` ~ "frequency"),
+    missing = "ifany"
+  ) %>%
+  modify_table_body(
+    ~ .x %>%
+      mutate(across(starts_with("stat_"), ~ str_replace_all(., "NA \\(NA, NA\\)", "NA") %>% str_replace_all("0 \\(NA%\\)", "NA")))
+  ) %>%
+  add_p()
+
+tbl.cirrhosis
+
+tbl.csph <- df_final %>%
+  mutate(
+    CSPH = case_when(
+      fsm > 20 ~ "CSPH (LSM > 20 kPa)",
+      fsm <= 20 ~ "No CSPH (LSM ≤ 20 kPa)",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(-id) %>%
+  select(
+    #Study = study,
+    `Age, median (IQR)` = age,
+    Gender = gender,
+    #Ethnicity = ethnicity,
+    Aboriginal = aboriginal,
+    #Height = height,
+    #Weight = weight,
+    `BMI, median (IQR)` = bmi,
+    `Obesity (BMI ≥ 30)` = obesity,
+    #`Alcohol frequency` = alcohol_frequency_cat,
+    #`Alcohol amount` = alcohol_amount_cat,
+    #`Alcohol binge frequency` = alcohol_binge_cat,
+    `AUDIT-C score` = audit_c_score,
+    `Hazardous alcohol use` = haz_alc,
+    HIV = hiv,
+    HBV = hbv,
+    CSPH
+    #`FIB-4 score` = fib4,
+    #`FIB-4 category` = fib4_cat,
+    #`APRI score` = apri,
+    #`APRI category` = apri_cat,
+    #ALT = alt,
+    #AST = ast,
+    #Platelets = platelets,
+    #Albumin = albumin,
+    #Creatinine = creatinine
+  ) %>%
+  tbl_summary(
+    by = "CSPH",
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = list(
+      all_continuous() ~ 1,
+      all_categorical() ~ c(0, 1)
+    ),
+    sort = list(
+      `Gender` ~ "frequency"),
+    missing = "ifany"
+  ) %>%
+  modify_table_body(
+    ~ .x %>%
+      mutate(across(starts_with("stat_"), ~ str_replace_all(., "NA \\(NA, NA\\)", "NA") %>% str_replace_all("0 \\(NA%\\)", "NA")))
+  ) %>%
+  add_p()
+
+tbl.csph
+
+tbl.outcomes <- tbl_merge(
+  list(tbl.cirrhosis, tbl.csph),
+  tab_spanner = c("**Cirrhosis**", "**Clinically significant\nportal hypertension**")) %>%
+  modify_footnote(
+    everything() ~ "Abbreviations: AUDIT-C = Alcohol Use Disorders Identification Test-Consumption; BMI = body mass index; CSPH = clinically significant portal hypertension; HBV = hepatitis B virus; HCV = hepatitis C virus; HIV = human immunodeficiency virus; kPa = kilopascals; LSM = liver stiffness measurement; NA = not available. Data are presented as median (Q1, Q3) or n (%)."
+  )
+
+tbl.outcomes 
+
+save_docx(tables = list(gtsummary::as_flex_table(tbl.outcomes)), filename = "Results/Descriptives/Table_2_cirrhosis_and_csph2.docx")
+
+```
+
+# Included vs excluded
+
+```{r}
+tbl.included_vs_excluded <- df_all %>%
+  filter(hcv == 1) %>%
+  mutate(invalid_fibroscan = if_else(fibro_valid == 0, 1, 0)) %>%
+  mutate(
+    Cohort = factor(cohort, levels = c("Included", "Excluded"))
+  ) %>%
+  select(
+    Cohort,
+    Study = study,
+    `Invalid Fibroscan` = invalid_fibroscan,
+    `Age, median (IQR)` = age,
+    Gender = gender,
+    #Ethnicity = ethnicity,
+    Aboriginal = aboriginal,
+    BMI = bmi,
+    `Obesity (BMI ≥ 30)` = obesity,
+    `AUDIT-C score` = audit_c_score,
+    `Hazardous alcohol use` = haz_alc,
+    HIV = hiv,
+    HBV = hbv,
+    `Median liver stiffness (kPa)` = fsm,
+    `Liver stiffness measurement (Metavir category)` = metavir,
+    `CSPH (>20 kPa)` = fsm_20
+  ) %>%
+  tbl_summary(
+    by = Cohort,
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = list(
+      all_continuous() ~ 1,
+      all_categorical() ~ c(0, 1)
+    ),
+   sort = list(
+      `Gender` ~ "frequency",
+      `Liver stiffness measurement (Metavir category)` ~ "frequency"),
+    missing = "ifany"
+  ) %>%
+  modify_table_body(
+    ~ .x %>%
+      mutate(across(starts_with("stat_"), ~ str_replace_all(., "NA \\(NA, NA\\)", "NA") %>% str_replace_all("0 \\(NA%\\)", "NA")))
+  ) %>%
+  add_p() %>%
+  modify_footnote(
+    everything() ~ "Abbreviations: AUDIT-C = Alcohol Use Disorders Identification Test-Consumption; BMI = body mass index; CSPH = clinically significant portal hypertension; HBV = hepatitis B virus; HCV = hepatitis C virus; HIV = human immunodeficiency virus; kPa = kilopascals; NA = not available. Data are presented as median (Q1, Q3) or n (%)."
+  )
+
+tbl.included_vs_excluded 
+
+save_docx(
+  tables = list(gtsummary::as_flex_table(tbl.included_vs_excluded)),
+  filename = "Results/Descriptives/Table_included_vs_excluded.docx"
+)
+```
+
+# Plots
+
+```{r}
+#Age distribution by study
+ggplot() +
+  geom_density(data = df_final, aes(x = age, fill = study), alpha = 0.5) +
+  labs(title = "Age Distribution by Study", x = "Age", y = "Density",
+       color = "Study") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggsave("Results/Descriptives/Age_distribution_by_study.png", width = 8, height = 5, dpi = 300)
+```
+
+```{r}
+ggplot() +
+  geom_density(data = df_final, aes(x = fsm, fill = study), alpha = 0.5) +
+  labs(title = "Median Liver Stiffness (kPa) Distribution by Study", 
+       x = "Median Liver Stiffness (kPa)", y = "Density",
+       color = "Study") +
+    geom_vline(xintercept = c(12.5), linetype = "dashed", color = "blue") +
+  geom_vline(xintercept = c(20), linetype = "dashed", color = "red") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggsave("Results/Descriptives/Fibroscan_distribution_by_study.png", width = 8, height = 5, dpi = 300)
+
+```
+
+```{R}
+# Scatterplot of liver stiffness versus age, with colour and shape identifying study.
+study_shapes <- setNames(0:10, sort(unique(df_final$study)))
+
+ggplot(df_final, aes(x = age, y = fsm, color = study, shape = study)) +
+  geom_point(alpha = 0.5, size = 1.2) +
+  #vline at 35, 40 and 45
+  geom_vline(xintercept = c(35, 40, 45), linetype = "dashed", color = "red") +
+  #hline at 12.5 and 20
+  geom_hline(yintercept = c(12.5, 20), linetype = "dashed", color = "blue") +
+  scale_shape_manual(values = study_shapes) +
+  scale_x_continuous(breaks = seq(20, 90, by = 5)) +
+  labs(title = "FibroScan Score vs Age by Study", x = "Age", y = "Liver Stiffness Measurement (kPa)", color = "Study", shape = "Study") +
+  guides(color = guide_legend(override.aes = list(alpha = 1, size = 2.5))) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggsave("Results/Descriptives/Fibroscan_vs_age_by_study.png", width = 8, height = 5, dpi = 300)
+
+#Scatterplot fsm vs age
+ggplot(df_final, aes(x = age, y = fsm)) +
+  geom_point(alpha = 0.5, color = "grey") +
+  #vline at 35, 40 and 45
+  geom_vline(xintercept = c(35, 40, 45), linetype = "dashed", color = "red") +
+  #hline at 12.5 and 20
+  geom_hline(yintercept = c(12.5, 20), linetype = "dashed", color = "blue") +
+  scale_x_continuous(breaks = seq(20, 90, by = 5)) +
+  labs(title = "FibroScan Score vs Age by Study", x = "Age", y = "Liver Stiffness Measurement (kPa)", color = "Study") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggsave("Results/Descriptives/Fibroscan_vs_age.png", width = 8, height = 5, dpi = 300)
+```
+
+```{r}
+# Mosaic plot (area proportional to prevalence): age bins (35/40/45) x FSM bins (12.5/20)
+df_mosaic <- df_final %>%
+  filter(!is.na(age), !is.na(fsm)) %>%
+  mutate(
+    age_bin = cut(
+      age,
+      breaks = c(-Inf, 35, 40, 45, Inf),
+      right = FALSE,
+      labels = c("<35", "35-39", "40-44", "45+")
+    ),
+    fsm_bin = cut(
+      fsm,
+      breaks = c(-Inf, 12.5, 20, Inf),
+      right = FALSE,
+      labels = c("<12.5", "12.5-19.9", "20+")
+    )
+  ) %>%
+  count(age_bin, fsm_bin, name = "n") %>%
+  tidyr::complete(
+    age_bin,
+    fsm_bin,
+    fill = list(n = 0)
+  ) %>%
+  group_by(age_bin) %>%
+  mutate(age_total = sum(n)) %>%
+  ungroup() %>%
+  mutate(
+    cohort_total = sum(n),
+    prop_overall = if_else(cohort_total > 0, n / cohort_total, 0),
+    prop_within_age = if_else(age_total > 0, n / age_total, 0)
+  )
+
+# Compute rectangle coordinates:
+# - Age bin widths proportional to age_total
+# - Within each age bin, FSM bin heights proportional to prop_within_age
+df_age_widths <- df_mosaic %>%
+  distinct(age_bin, age_total) %>%
+  arrange(age_bin) %>%
+  mutate(
+    .denom = sum(age_total),
+    x_width = if_else(.denom > 0, age_total / .denom, rep(0, dplyr::n())),
+    x_min = lag(cumsum(x_width), default = 0),
+    x_max = cumsum(x_width)
+  ) %>%
+  select(-.denom)
+
+df_rect <- df_mosaic %>%
+  left_join(df_age_widths, by = "age_bin") %>%
+  arrange(age_bin, fsm_bin) %>%
+  group_by(age_bin) %>%
+  mutate(
+    y_min = lag(cumsum(prop_within_age), default = 0),
+    y_max = cumsum(prop_within_age),
+    label = paste0(
+      "n=", n,
+      "\n", scales::percent(prop_within_age, accuracy = 0.1)
+    )
+  ) %>%
+  ungroup()
+
+df_rect <- df_rect %>%
+  mutate(
+    x_mid = (x_min + x_max) / 2,
+    y_mid = (y_min + y_max) / 2,
+    area = (x_max - x_min) * (y_max - y_min)
+  ) %>%
+  filter(n > 0)
+
+ggplot(df_rect) +
+  geom_rect(
+    aes(
+      xmin = x_min,
+      xmax = x_max,
+      ymin = y_min,
+      ymax = y_max,
+      fill = fsm_bin
+    ),
+    color = "white"
+  ) +
+  ggrepel::geom_label_repel(
+    aes(x = x_mid, y = y_mid, label = label),
+    seed = 1,
+    size = 3,
+    label.size = 0.15,
+    label.r = unit(0.1, "lines"),
+    box.padding = 0.25,
+    point.padding = 0.1,
+    min.segment.length = 0,
+    segment.size = 0.2,
+    max.overlaps = Inf
+  ) +
+  scale_x_continuous(
+    breaks = (df_age_widths$x_min + df_age_widths$x_max) / 2,
+    labels = as.character(df_age_widths$age_bin),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(
+    title = "Mosaic: FSM bins by age bins (area = % of cohort)",
+    x = "Age (years)",
+    y = NULL,
+    fill = "FibroScan (kPa)"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.ticks = element_blank(),
+    axis.text.y = element_blank(),
+    legend.position = "bottom"
+  )
+
+ggsave("Results/Descriptives/Mosaic_FSM_bins_by_age_bins.png", width = 8, height = 5, dpi = 300)
+```
+
+```{r}
+#Proportion with fsm > 12.5 by age category
+df_final %>%
+  mutate(
+    age_cat = cut(
+      age,
+      breaks = c(-Inf, 35, 40, 45, Inf),
+      labels = c("Less than 35", "35-39", "40-44", "45 and above"),
+      right = FALSE
+    )
+  ) %>%
+  filter(!is.na(age_cat)) %>%
+  group_by(age_cat) %>%
+  summarise(
+    n = n(),
+    prop_12.5 = mean(fsm > 12.5, na.rm = TRUE),
+    prop_20 = mean(fsm > 20, na.rm = TRUE)
+  ) %>%
+  tidyr::pivot_longer(cols = c(prop_12.5, prop_20), names_to = "threshold", values_to = "prop") %>%
+  mutate(
+     threshold_label = case_when(
+        threshold == "prop_12.5" ~ "> 12.5 kPa",
+        threshold == "prop_20" ~ "> 20 kPa"
+     )
+  ) %>%
+  ggplot(aes(age_cat, prop, color = threshold_label, group = threshold_label)) +
+  geom_point(size = 3) +
+  geom_line() +
+  geom_errorbar(
+    aes(
+      ymin = prop - 1.96 * sqrt((prop * (1 - prop)) / n),
+      ymax = prop + 1.96 * sqrt((prop * (1 - prop)) / n)
+    ),
+    width = 0.2
+  ) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    x = "Age group",
+    y = "Proportion with LSM above threshold",
+    color = "Liver Stiffness\nMeasurement Threshold"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggsave("Results/Descriptives/Proportion_fsm_over_12.5_by_age_group.png", width = 8, height = 5, dpi = 300)
+```
+
+```{r}
+#Heat plot
+
+df_plot <- df_final %>%
+  mutate(
+    age_cat = cut(
+      age, 
+      breaks = c(18, 35, 45, 55, 65, 100), 
+      labels = c(
+        "18–34",
+        "35–44",
+        "45–54",
+        "55–64",
+        "≥65"
+      ),
+      right = FALSE),
+    fsm_high = fsm > 12.5
+  ) %>%
+  group_by(study, age_cat) %>%
+  summarise(
+    prop = mean(fsm_high, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    prop_cat = cut(
+      prop,
+      breaks = c(0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35),
+      labels = c(
+        "0–5%",
+        "5–10%",
+        "10–15%",
+        "15–20%",
+        "20–25%",
+        "25–30%",
+        "30–35%"
+      ),
+      include.lowest = TRUE,
+      right = FALSE
+    )
+  )
+
+
+ggplot(df_plot, aes(age_cat, study, fill = prop_cat)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  scale_fill_discrete_sequential(
+    palette = "Heat",
+    name = "Proportion with\nmedian liver stiffness > 12.5 kPa"
+  ) +
+  labs(
+    x = "Age group",
+    y = "Study"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "right",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+ggsave("Results/Descriptives/Heatmap_fsm_over_12.5_by_age_and_study.png", width = 8, height = 5, dpi = 300)
+
+```
+
+```{r}
+# define hazardous alcohol (edit threshold to match your definition)
+df_long <- df_final %>%
+  mutate(
+    age_cat = cut(
+      age, 
+      breaks = c(18, 35, 45, 55, 65, 100), 
+      labels = c(
+        "18–34",
+        "35–44",
+        "45–54",
+        "55–64",
+        "≥65"
+      ),
+      right = FALSE),
+    fsm_high = fsm > 12.5,
+    gender = factor(gender, levels = c("Female", "Male",  "Transgender")),
+    hiv = as.character(hiv),
+    hbv = as.character(hbv),
+    aboriginal = as.character(aboriginal)
+  ) %>%
+  rename(
+    Gender = gender,
+    Aboriginal = aboriginal,
+    HIV = hiv,
+    HBV = hbv,
+    `Alcohol use` = haz_alc,
+    Obesity = obesity
+  ) %>%
+  # put stratifiers into long form
+  pivot_longer(
+    cols = c(Gender, Aboriginal, HIV, HBV, `Alcohol use`, Obesity),
+    names_to = "stratifier",
+    values_to = "level"
+  ) %>%
+  filter(!is.na(level))
+
+df_plot <- df_long %>%
+  group_by(stratifier, level, age_cat) %>%
+  summarise(
+    prop = mean(fsm_high, na.rm = TRUE),
+    n = sum(!is.na(fsm_high)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    prop_cat = cut(
+      prop,
+      breaks = c(0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 1),
+      labels = c("0–5%","5–10%","10–15%","15–20%","20–25%","25–30%","30–35%","≥35%"),
+      include.lowest = TRUE,
+      right = FALSE
+    )
+    #level = paste0(level, " (n=", n, ")")  # optional: show denominators
+  ) %>%
+  mutate(
+    stratifier = factor(stratifier, levels = c("Gender", "Aboriginal", "HIV", "HBV", "Alcohol use", "Obesity"))
+  )
+
+ggplot(df_plot, aes(age_cat, level, fill = prop_cat)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  facet_wrap(~ stratifier, scales = "free_y", ncol = 2) +
+  scale_fill_brewer(
+    palette = "YlOrRd",
+    name = "Proportion with\nmedian liver stiffness > 12.5 kPa"
+  ) +
+  labs(x = "Age group", y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "right",
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold")
+  )
+
+ggsave("Results/Descriptives/Heatmap_fsm_over_12.5_by_age_and_stratifier.png", width = 10, height = 8, dpi = 300)
+```
+
+

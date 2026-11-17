@@ -1,0 +1,683 @@
+---
+title: "Decision Curve Analysis: Subgroup Analyses (Frequentist)"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+library(pacman)
+p_load(tidyverse, dcurves, patchwork)
+
+dir.create("Results/Subgroup", recursive = TRUE, showWarnings = FALSE)
+
+# Keep Results tidy: remove previously-generated per-level subgroup PNGs.
+# (Panels like *_panel.png and the combined All_Panels are retained.)
+old_level_pngs <- list.files(
+  "Results",
+  pattern = "^DCA_Subgroup_.*\\.png$",
+  full.names = TRUE
+)
+old_level_pngs <- old_level_pngs[!grepl("(panel|All_Panels)\\.png$", old_level_pngs)]
+if (length(old_level_pngs) > 0) unlink(old_level_pngs)
+
+old_subgroup_csvs <- c(
+  list.files("Results/Subgroup", pattern = "^DCA_Subgroup_.*_net_benefit\\.csv$", full.names = TRUE),
+  list.files("Results/Subgroup", pattern = "^DCA_CSPH_Subgroup_.*_net_benefit\\.csv$", full.names = TRUE)
+)
+if (length(old_subgroup_csvs) > 0) unlink(old_subgroup_csvs)
+```
+
+# Load Data
+
+```{r}
+df <- read_csv("Data/merged_data.csv", show_col_types = FALSE)
+
+df_analysis <- df %>%
+  filter(!is.na(fsm), !is.na(age))
+
+print(paste("Analysis N:", nrow(df_analysis)))
+```
+
+# Prepare Outcome + Strategies
+
+```{r}
+prep_dca_df <- function(data) {
+  data %>%
+    mutate(
+      outcome_cirrhosis = if_else(fsm >= 12.5, 1L, 0L),
+      strategy_age35 = if_else(age > 35, 1L, 0L),
+      strategy_age40 = if_else(age > 40, 1L, 0L),
+      strategy_age45 = if_else(age > 45, 1L, 0L),
+      obesity = case_when(
+        is.na(bmi) ~ NA_character_,
+        bmi >= 30 ~ "Obese (BMI ≥ 30)",
+        bmi < 30 ~ "Not obese (BMI < 30)"
+      )
+    )
+}
+
+strategy_labels <- list(
+  strategy_age35 = "Age > 35",
+  strategy_age40 = "Age > 40",
+  strategy_age45 = "Age > 45"
+)
+
+threshold_grid <- seq(0, 0.4, by = 0.01)
+
+plot_xlim <- c(0, 0.4)
+plot_ylim <- c(-0.01, 0.3)
+
+legend_label <- function(x) {
+  dplyr::case_when(
+    x == "Treat All" ~ "Screen All",
+    x == "Treat None" ~ "Screen None",
+    TRUE ~ x
+  )
+}
+
+color_map <- function(labels) {
+  # Treat all/none are always black; age strategies get consistent colors
+  out <- rep(NA_character_, length(labels))
+  names(out) <- labels
+  out[labels %in% c("Screen All", "Screen None")] <- "black"
+  out[labels == "Age > 35"] <- "#1b9e77"
+  out[labels == "Age > 40"] <- "#d95f02"
+  out[labels == "Age > 45"] <- "#7570b3"
+  out
+}
+
+linetype_map <- function(labels) {
+  out <- rep("solid", length(labels))
+  names(out) <- labels
+  out[labels == "Screen None"] <- "dotted"
+  out
+}
+
+legend_breaks <- function(labels_present) {
+  desired <- c("Screen All", "Screen None", "Age > 35", "Age > 40", "Age > 45")
+  desired[desired %in% labels_present]
+}
+
+df_dca <- prep_dca_df(df_analysis) %>%
+  mutate(
+    hiv = case_when(
+      hiv == "Positive" ~ "HIV infection",
+      hiv == "Negative" ~ "No HIV infection",
+      TRUE ~ hiv
+    ),
+    hbv = case_when(
+      hbv == "Positive" ~ "HBV infection",
+      hbv == "Negative" ~ "No HBV infection",
+      TRUE ~ hbv
+    ),
+    aboriginal = case_when(
+      aboriginal == "Indigenous" ~ "Aboriginal and/or\nTorres Strait Islander",
+      TRUE ~ aboriginal
+    ),
+    hazardous_alcohol_use = case_when(
+      hazardous_alcohol_use == "Yes" ~ "Hazardous alcohol use",
+      hazardous_alcohol_use == "No" ~ "No hazardous alcohol use",
+      TRUE ~ hazardous_alcohol_use
+    ),
+    csph = case_when(
+      fsm_20 == 1 ~ "CSPH (>20 kPa)",
+      fsm_20 == 0 ~ "No CSPH (\u226420 kPa)",
+      TRUE ~ NA_character_
+    )
+  )
+
+df_dca %>%
+  count(outcome_cirrhosis) %>%
+  mutate(prop = n / sum(n))
+```
+
+# Subgroup DCA
+
+```{r}
+sanitize_level <- function(x) {
+  x %>%
+    as.character() %>%
+    stringr::str_trim() %>%
+    dplyr::if_else(. == "", "Missing", .) %>%
+    stringr::str_replace_all("[^A-Za-z0-9]+", "_")
+}
+
+run_dca_subset <- function(data, subgroup_name, subgroup_level) {
+  # Require both events and non-events for DCA
+  if (nrow(data) < 50 || n_distinct(data$outcome_cirrhosis) < 2) {
+    return(NULL)
+  }
+
+  dca_result <- dca(
+    formula = outcome_cirrhosis ~ strategy_age35 + strategy_age40 + strategy_age45,
+    data = data,
+    thresholds = threshold_grid,
+    label = strategy_labels
+  )
+
+  dca_tbl <- dca_result %>%
+    as_tibble()
+
+  dca_tbl <- dca_tbl %>%
+    mutate(
+      label_display = legend_label(as.character(label))
+    )
+
+  breaks_here <- legend_breaks(unique(dca_tbl$label_display))
+  colors_here <- color_map(breaks_here)
+  linetypes_here <- linetype_map(breaks_here)
+
+  p <- dca_tbl %>%
+    ggplot(aes(x = threshold, y = net_benefit, color = label_display, linetype = label_display)) +
+    geom_line(linewidth = 1) +
+    coord_cartesian(xlim = plot_xlim, ylim = plot_ylim) +
+    theme_classic() +
+    scale_color_manual(values = colors_here, breaks = breaks_here, name = NULL) +
+    scale_linetype_manual(values = linetypes_here, breaks = breaks_here, name = NULL) +
+    guides(
+      # Use a single legend (color), but override keys to show dashed Screen None
+      color = guide_legend(override.aes = list(linetype = unname(linetypes_here))),
+      linetype = "none"
+    ) +
+    labs(
+      title = paste0(
+        subgroup_level,
+        " (N=", nrow(data), ")"
+      ),
+      x = "Threshold Probability",
+      y = "Net Benefit",
+      color = NULL
+    )
+
+  list(
+    dca_result = dca_result,
+    dca_tbl = dca_tbl,
+    plot = p,
+    nia_tbl = dcurves::net_intervention_avoided(dca_result) %>% as_tibble(),
+    nia_plot = {
+      dca_result |>
+  net_intervention_avoided() |>
+  plot(smooth = TRUE) +
+  aes(color = label, linetype = label) +
+  theme_classic() +
+  scale_linetype_manual(values = c(
+    "Treat All" = "solid",
+    "Treat None" = "dashed",
+    "Age > 35" = "solid",
+    "Age > 40" = "solid",
+    "Age > 45" = "solid"
+  )) +
+  scale_color_manual(
+    values = c(
+      "Treat All" = "black",
+      "Treat None" = "black",
+      "Age > 35" = "#1b9e77",
+      "Age > 40" = "#d95f02",
+      "Age > 45" = "#7570b3"
+    ),
+    labels = c(
+      "Treat All" = "Screen All",
+      "Treat None" = "Screen None",
+      "Age > 35" = "Age > 35",
+      "Age > 40" = "Age > 40",
+      "Age > 45" = "Age > 45"
+    )
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  guides(
+    color = guide_legend(override.aes = list(linetype = c("solid", "dotted", "solid", "solid", "solid"))),
+    linetype = "none"
+  ) +
+  labs(
+    title = paste0(subgroup_level, " (N=", nrow(data), ")"),
+    x = "Threshold Probability",
+    y = "Net interventions avoided",
+    color = NULL
+  )
+    }
+  )
+}
+
+subgroups <- list(
+  list(name = "Gender", var = "gender"),
+  list(name = "Aboriginal", var = "aboriginal"),
+  list(name = "HIV", var = "hiv"),
+  list(name = "HBV", var = "hbv"),
+  list(name = "Hazardous alcohol use", var = "hazardous_alcohol_use"),
+  list(name = "Obesity", var = "obesity")
+)
+
+subgroup_outputs <- subgroups %>%
+  map(function(sg) {
+    var <- sg$var
+
+    df_sg <- df_dca %>%
+      filter(!is.na(.data[[var]])) %>%
+      mutate(.level = as.character(.data[[var]])) %>%
+      group_by(.level) %>%
+      group_nest() %>%
+      mutate(
+        n = map_int(data, nrow),
+        events = map_int(data, ~ sum(.x$outcome_cirrhosis, na.rm = TRUE)),
+        res = map2(data, .level, ~ run_dca_subset(.x, subgroup_name = sg$name, subgroup_level = .y))
+      ) %>%
+      filter(!map_lgl(res, is.null)) %>%
+      mutate(
+        plot = map(res, "plot"),
+        dca_tbl = map(res, "dca_tbl"),
+        nia_plot = map(res, "nia_plot"),
+        safe_level = map_chr(.level, sanitize_level),
+        csv_file = paste0("Results/Subgroup/DCA_Subgroup_", sanitize_level(sg$name), "_", safe_level, "_net_benefit.csv")
+      )
+
+    # Save per-level outputs
+    walk2(df_sg$dca_tbl, df_sg$csv_file, ~ write_csv(.x, .y))
+
+    df_sg %>%
+      mutate(subgroup = sg$name) %>%
+      select(subgroup, level = .level, n, events, csv_file, plot, nia_plot)
+  })
+
+subgroup_results <- bind_rows(subgroup_outputs)
+
+# Write an index (without embedding plot objects)
+subgroup_index <- subgroup_results %>%
+  select(-plot)
+write_csv(subgroup_index, "Results/Subgroup/DCA_Subgroup_Index.csv")
+
+# Patchwork panels for HIV and HBV
+make_two_panel <- function(results, subgroup_name, left_level, right_level, out_file) {
+  dfp <- results %>%
+    filter(subgroup == subgroup_name, level %in% c(left_level, right_level)) %>%
+    mutate(level = factor(level, levels = c(left_level, right_level))) %>%
+    arrange(level)
+
+  if (nrow(dfp) != 2) {
+    return(invisible(NULL))
+  }
+
+  panel <- (dfp$plot[[1]] | dfp$plot[[2]])
+
+  panel_saved <- panel +
+    plot_layout(guides = "collect") &
+    theme(legend.position = "bottom")
+
+  ggsave(out_file, plot = panel_saved, width = 14, height = 5, dpi = 300)
+  panel
+}
+
+make_two_panel_nia <- function(results, subgroup_name, left_level, right_level, out_file) {
+  dfp <- results %>%
+    filter(subgroup == subgroup_name, level %in% c(left_level, right_level)) %>%
+    mutate(level = factor(level, levels = c(left_level, right_level))) %>%
+    arrange(level)
+
+  if (nrow(dfp) != 2) {
+    return(invisible(NULL))
+  }
+
+  panel <- (dfp$nia_plot[[1]] | dfp$nia_plot[[2]])
+
+  panel_saved <- panel +
+    plot_layout(guides = "collect") &
+    theme(legend.position = "bottom")
+
+  ggsave(out_file, plot = panel_saved, width = 14, height = 5, dpi = 300)
+  panel
+}
+
+panel_hiv <- make_two_panel(subgroup_results, "HIV", "No HIV infection", "HIV infection", "Results/Subgroup/DCA_Subgroup_HIV_panel.png")
+panel_hbv <- make_two_panel(subgroup_results, "HBV", "No HBV infection", "HBV infection", "Results/Subgroup/DCA_Subgroup_HBV_panel.png")
+panel_aboriginal <- make_two_panel(subgroup_results, "Aboriginal", "Aboriginal and/or\nTorres Strait Islander", "Non-Indigenous", "Results/Subgroup/DCA_Subgroup_Aboriginal_panel.png")
+panel_gender <- make_two_panel(subgroup_results, "Gender", "Male", "Female", "Results/Subgroup/DCA_Subgroup_Gender_panel.png")
+panel_hazardous <- make_two_panel(subgroup_results, "Hazardous alcohol use", "No hazardous alcohol use", "Hazardous alcohol use", "Results/Subgroup/DCA_Subgroup_Hazardous_alcohol_use_panel.png")
+panel_obesity <- make_two_panel(subgroup_results, "Obesity", "Not obese (BMI < 30)", "Obese (BMI ≥ 30)", "Results/Subgroup/DCA_Subgroup_Obesity_panel.png")
+
+nia_panel_hiv <- make_two_panel_nia(subgroup_results, "HIV", "No HIV infection", "HIV infection", "Results/Subgroup/NIA_Subgroup_HIV_panel.png")
+nia_panel_hbv <- make_two_panel_nia(subgroup_results, "HBV", "No HBV infection", "HBV infection", "Results/Subgroup/NIA_Subgroup_HBV_panel.png")
+nia_panel_aboriginal <- make_two_panel_nia(subgroup_results, "Aboriginal", "Aboriginal and/or\nTorres Strait Islander", "Non-Indigenous", "Results/Subgroup/NIA_Subgroup_Aboriginal_panel.png")
+nia_panel_gender <- make_two_panel_nia(subgroup_results, "Gender", "Male", "Female", "Results/Subgroup/NIA_Subgroup_Gender_panel.png")
+nia_panel_hazardous <- make_two_panel_nia(subgroup_results, "Hazardous alcohol use", "No hazardous alcohol use", "Hazardous alcohol use", "Results/Subgroup/NIA_Subgroup_Hazardous_alcohol_use_panel.png")
+nia_panel_obesity <- make_two_panel_nia(subgroup_results, "Obesity", "Not obese (BMI < 30)", "Obese (BMI ≥ 30)", "Results/Subgroup/NIA_Subgroup_Obesity_panel.png")
+
+# Combined panel with all subgroup panels
+# To guarantee a single legend, strip legends from all plots except one.
+get_plot <- function(results, subgroup_name, level_name) {
+  out <- results %>%
+    filter(subgroup == subgroup_name, level == level_name) %>%
+    slice_head(n = 1)
+  if (nrow(out) == 0) return(NULL)
+  out$plot[[1]]
+}
+
+p_gender_m <- get_plot(subgroup_results, "Gender", "Male")
+p_gender_f <- get_plot(subgroup_results, "Gender", "Female")
+p_abor_i <- get_plot(subgroup_results, "Aboriginal", "Aboriginal and/or\nTorres Strait Islander")
+p_abor_n <- get_plot(subgroup_results, "Aboriginal", "Non-Indigenous")
+p_hiv_n <- get_plot(subgroup_results, "HIV", "No HIV infection")
+p_hiv_p <- get_plot(subgroup_results, "HIV", "HIV infection")
+p_hbv_n <- get_plot(subgroup_results, "HBV", "No HBV infection")
+p_hbv_p <- get_plot(subgroup_results, "HBV", "HBV infection")
+p_haz_n <- get_plot(subgroup_results, "Hazardous alcohol use", "No hazardous alcohol use")
+p_haz_y <- get_plot(subgroup_results, "Hazardous alcohol use", "Hazardous alcohol use")
+p_obese_n <- get_plot(subgroup_results, "Obesity", "Not obese (BMI < 30)")
+p_obese_y <- get_plot(subgroup_results, "Obesity", "Obese (BMI ≥ 30)")
+
+all_needed <- list(p_gender_m, p_gender_f, p_abor_i, p_abor_n, p_hiv_n, p_hiv_p, p_hbv_n, p_hbv_p, p_haz_n, p_haz_y, p_obese_n, p_obese_y)
+if (!any(map_lgl(all_needed, is.null))) {
+  # Keep legend only in the first plot
+  p_gender_f <- p_gender_f + theme(legend.position = "none")
+  p_abor_i <- p_abor_i + theme(legend.position = "none")
+  p_abor_n <- p_abor_n + theme(legend.position = "none")
+  p_hiv_n <- p_hiv_n + theme(legend.position = "none")
+  p_hiv_p <- p_hiv_p + theme(legend.position = "none")
+  p_hbv_n <- p_hbv_n + theme(legend.position = "none")
+  p_hbv_p <- p_hbv_p + theme(legend.position = "none")
+  p_haz_n <- p_haz_n + theme(legend.position = "none")
+  p_haz_y <- p_haz_y + theme(legend.position = "none")
+  p_obese_n <- p_obese_n + theme(legend.position = "none")
+  p_obese_y <- p_obese_y + theme(legend.position = "none")
+
+  combined <- wrap_plots(
+    list(
+      (p_gender_m | p_gender_f),
+      (p_abor_i | p_abor_n),
+      (p_hiv_n | p_hiv_p),
+      (p_hbv_n | p_hbv_p),
+      (p_haz_n | p_haz_y)
+      ,
+      (p_obese_n | p_obese_y)
+    ),
+    ncol = 2
+  ) +
+    plot_layout(guides = "collect") &
+    theme(legend.position = "bottom")
+
+  ggsave("Results/Subgroup/DCA_Subgroup_All_Panels.png", plot = combined, width = 14, height = 14, dpi = 300)
+}
+
+# NIA combined panel (single legend)
+get_nia_plot <- function(results, subgroup_name, level_name) {
+  out <- results %>%
+    filter(subgroup == subgroup_name, level == level_name) %>%
+    slice_head(n = 1)
+  if (nrow(out) == 0) return(NULL)
+  out$nia_plot[[1]]
+}
+
+np_gender_m <- get_nia_plot(subgroup_results, "Gender", "Male")
+np_gender_f <- get_nia_plot(subgroup_results, "Gender", "Female")
+np_abor_i <- get_nia_plot(subgroup_results, "Aboriginal", "Aboriginal and/or\nTorres Strait Islander")
+np_abor_n <- get_nia_plot(subgroup_results, "Aboriginal", "Non-Indigenous")
+np_hiv_n <- get_nia_plot(subgroup_results, "HIV", "No HIV infection")
+np_hiv_p <- get_nia_plot(subgroup_results, "HIV", "HIV infection")
+np_hbv_n <- get_nia_plot(subgroup_results, "HBV", "No HBV infection")
+np_hbv_p <- get_nia_plot(subgroup_results, "HBV", "HBV infection")
+np_haz_n <- get_nia_plot(subgroup_results, "Hazardous alcohol use", "No hazardous alcohol use")
+np_haz_y <- get_nia_plot(subgroup_results, "Hazardous alcohol use", "Hazardous alcohol use")
+np_obese_n <- get_nia_plot(subgroup_results, "Obesity", "Not obese (BMI < 30)")
+np_obese_y <- get_nia_plot(subgroup_results, "Obesity", "Obese (BMI ≥ 30)")
+
+nia_needed <- list(np_gender_m, np_gender_f, np_abor_i, np_abor_n, np_hiv_n, np_hiv_p, np_hbv_n, np_hbv_p, np_haz_n, np_haz_y, np_obese_n, np_obese_y)
+if (!any(map_lgl(nia_needed, is.null))) {
+  np_gender_f <- np_gender_f + theme(legend.position = "none")
+  np_abor_i <- np_abor_i + theme(legend.position = "none")
+  np_abor_n <- np_abor_n + theme(legend.position = "none")
+  np_hiv_n <- np_hiv_n + theme(legend.position = "none")
+  np_hiv_p <- np_hiv_p + theme(legend.position = "none")
+  np_hbv_n <- np_hbv_n + theme(legend.position = "none")
+  np_hbv_p <- np_hbv_p + theme(legend.position = "none")
+  np_haz_n <- np_haz_n + theme(legend.position = "none")
+  np_haz_y <- np_haz_y + theme(legend.position = "none")
+  np_obese_n <- np_obese_n + theme(legend.position = "none")
+  np_obese_y <- np_obese_y + theme(legend.position = "none")
+
+  nia_combined <- wrap_plots(
+    list(
+      (np_gender_m | np_gender_f),
+      (np_abor_i | np_abor_n),
+      (np_hiv_n | np_hiv_p),
+      (np_hbv_n | np_hbv_p),
+      (np_haz_n | np_haz_y)
+      ,
+      (np_obese_n | np_obese_y)
+    ),
+    ncol = 2
+  ) +
+    plot_layout(guides = "collect") &
+    theme(legend.position = "bottom")
+
+  ggsave("Results/Subgroup/NIA_Subgroup_All_Panels.png", plot = nia_combined, width = 14, height = 14, dpi = 300)
+}
+
+subgroup_index
+```
+
+# Subgroup DCA — CSPH as outcome
+
+```{r}
+run_dca_subset_csph <- function(data, subgroup_name, subgroup_level) {
+  if (nrow(data) < 50 || n_distinct(data$outcome_csph) < 2) {
+    return(NULL)
+  }
+
+  dca_result <- dca(
+    formula = outcome_csph ~ strategy_age35 + strategy_age40 + strategy_age45,
+    data = data,
+    thresholds = threshold_grid,
+    label = strategy_labels
+  )
+
+  dca_tbl <- dca_result %>%
+    as_tibble() %>%
+    mutate(label_display = legend_label(as.character(label)))
+
+  breaks_here    <- legend_breaks(unique(dca_tbl$label_display))
+  colors_here    <- color_map(breaks_here)
+  linetypes_here <- linetype_map(breaks_here)
+
+  p <- dca_tbl %>%
+    ggplot(aes(x = threshold, y = net_benefit, color = label_display, linetype = label_display)) +
+    geom_line(linewidth = 1) +
+    coord_cartesian(xlim = plot_xlim, ylim = plot_ylim) +
+    theme_classic() +
+    scale_color_manual(values = colors_here, breaks = breaks_here, name = NULL) +
+    scale_linetype_manual(values = linetypes_here, breaks = breaks_here, name = NULL) +
+    guides(
+      color = guide_legend(override.aes = list(linetype = unname(linetypes_here))),
+      linetype = "none"
+    ) +
+    labs(
+      title = paste0(subgroup_level, " (N=", nrow(data), ")"),
+      x = "Threshold Probability",
+      y = "Net Benefit",
+      color = NULL
+    )
+
+  list(
+    dca_result = dca_result,
+    dca_tbl    = dca_tbl,
+    plot       = p,
+    nia_tbl    = dcurves::net_intervention_avoided(dca_result) %>% as_tibble(),
+    nia_plot   = {
+      dca_result |>
+        net_intervention_avoided() |>
+        plot(smooth = TRUE) +
+        aes(color = label, linetype = label) +
+        theme_classic() +
+        scale_linetype_manual(values = c(
+          "Treat All" = "solid", "Treat None" = "dashed",
+          "Age > 35" = "solid", "Age > 40" = "solid", "Age > 45" = "solid"
+        )) +
+        scale_color_manual(
+          values = c(
+            "Treat All" = "black", "Treat None" = "black",
+            "Age > 35" = "#1b9e77", "Age > 40" = "#d95f02", "Age > 45" = "#7570b3"
+          ),
+          labels = c(
+            "Treat All" = "Screen All", "Treat None" = "Screen None",
+            "Age > 35" = "Age > 35", "Age > 40" = "Age > 40", "Age > 45" = "Age > 45"
+          )
+        ) +
+        geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+        guides(
+          color = guide_legend(override.aes = list(linetype = c("solid", "dotted", "solid", "solid", "solid"))),
+          linetype = "none"
+        ) +
+        labs(
+          title = paste0(subgroup_level, " (N=", nrow(data), ")"),
+          x = "Threshold Probability",
+          y = "Net interventions avoided",
+          color = NULL
+        )
+    }
+  )
+}
+
+df_dca_csph <- df_dca %>%
+  mutate(outcome_csph = as.integer(fsm_20 == 1))
+
+subgroup_outputs_csph <- subgroups %>%
+  map(function(sg) {
+    var <- sg$var
+
+    df_sg <- df_dca_csph %>%
+      filter(!is.na(.data[[var]])) %>%
+      mutate(.level = as.character(.data[[var]])) %>%
+      group_by(.level) %>%
+      group_nest() %>%
+      mutate(
+        n      = map_int(data, nrow),
+        events = map_int(data, ~ sum(.x$outcome_csph, na.rm = TRUE)),
+        res    = map2(data, .level, ~ run_dca_subset_csph(.x, subgroup_name = sg$name, subgroup_level = .y))
+      ) %>%
+      filter(!map_lgl(res, is.null)) %>%
+      mutate(
+        plot      = map(res, "plot"),
+        dca_tbl   = map(res, "dca_tbl"),
+        nia_plot  = map(res, "nia_plot"),
+        safe_level = map_chr(.level, sanitize_level),
+        csv_file  = paste0("Results/Subgroup/DCA_CSPH_Subgroup_", sanitize_level(sg$name), "_", safe_level, "_net_benefit.csv")
+      )
+
+    walk2(df_sg$dca_tbl, df_sg$csv_file, ~ write_csv(.x, .y))
+
+    df_sg %>%
+      mutate(subgroup = sg$name) %>%
+      select(subgroup, level = .level, n, events, csv_file, plot, nia_plot)
+  })
+
+subgroup_results_csph <- bind_rows(subgroup_outputs_csph)
+
+# Two-panel plots (CSPH outcome)
+panel_csph_hiv       <- make_two_panel(subgroup_results_csph, "HIV",                  "No HIV infection",                      "HIV infection",         "Results/Subgroup/DCA_CSPH_Subgroup_HIV_panel.png")
+panel_csph_hbv       <- make_two_panel(subgroup_results_csph, "HBV",                  "No HBV infection",                      "HBV infection",         "Results/Subgroup/DCA_CSPH_Subgroup_HBV_panel.png")
+panel_csph_aboriginal <- make_two_panel(subgroup_results_csph, "Aboriginal",           "Aboriginal and/or\nTorres Strait Islander", "Non-Indigenous",    "Results/Subgroup/DCA_CSPH_Subgroup_Aboriginal_panel.png")
+panel_csph_gender    <- make_two_panel(subgroup_results_csph, "Gender",               "Male",                                  "Female",                "Results/Subgroup/DCA_CSPH_Subgroup_Gender_panel.png")
+panel_csph_hazardous <- make_two_panel(subgroup_results_csph, "Hazardous alcohol use", "No hazardous alcohol use",              "Hazardous alcohol use", "Results/Subgroup/DCA_CSPH_Subgroup_Hazardous_alcohol_use_panel.png")
+panel_csph_obesity   <- make_two_panel(subgroup_results_csph, "Obesity",              "Not obese (BMI < 30)",                  "Obese (BMI \u2265 30)", "Results/Subgroup/DCA_CSPH_Subgroup_Obesity_panel.png")
+
+nia_panel_csph_hiv       <- make_two_panel_nia(subgroup_results_csph, "HIV",                  "No HIV infection",                      "HIV infection",         "Results/Subgroup/NIA_CSPH_Subgroup_HIV_panel.png")
+nia_panel_csph_hbv       <- make_two_panel_nia(subgroup_results_csph, "HBV",                  "No HBV infection",                      "HBV infection",         "Results/Subgroup/NIA_CSPH_Subgroup_HBV_panel.png")
+nia_panel_csph_aboriginal <- make_two_panel_nia(subgroup_results_csph, "Aboriginal",           "Aboriginal and/or\nTorres Strait Islander", "Non-Indigenous",    "Results/Subgroup/NIA_CSPH_Subgroup_Aboriginal_panel.png")
+nia_panel_csph_gender    <- make_two_panel_nia(subgroup_results_csph, "Gender",               "Male",                                  "Female",                "Results/Subgroup/NIA_CSPH_Subgroup_Gender_panel.png")
+nia_panel_csph_hazardous <- make_two_panel_nia(subgroup_results_csph, "Hazardous alcohol use", "No hazardous alcohol use",              "Hazardous alcohol use", "Results/Subgroup/NIA_CSPH_Subgroup_Hazardous_alcohol_use_panel.png")
+nia_panel_csph_obesity   <- make_two_panel_nia(subgroup_results_csph, "Obesity",              "Not obese (BMI < 30)",                  "Obese (BMI \u2265 30)", "Results/Subgroup/NIA_CSPH_Subgroup_Obesity_panel.png")
+
+# Combined all-panels (CSPH outcome)
+cp_gender_m  <- get_plot(subgroup_results_csph, "Gender",               "Male")
+cp_gender_f  <- get_plot(subgroup_results_csph, "Gender",               "Female")
+cp_abor_i    <- get_plot(subgroup_results_csph, "Aboriginal",           "Aboriginal and/or\nTorres Strait Islander")
+cp_abor_n    <- get_plot(subgroup_results_csph, "Aboriginal",           "Non-Indigenous")
+cp_hiv_n     <- get_plot(subgroup_results_csph, "HIV",                  "No HIV infection")
+cp_hiv_p     <- get_plot(subgroup_results_csph, "HIV",                  "HIV infection")
+cp_hbv_n     <- get_plot(subgroup_results_csph, "HBV",                  "No HBV infection")
+cp_hbv_p     <- get_plot(subgroup_results_csph, "HBV",                  "HBV infection")
+cp_haz_n     <- get_plot(subgroup_results_csph, "Hazardous alcohol use", "No hazardous alcohol use")
+cp_haz_y     <- get_plot(subgroup_results_csph, "Hazardous alcohol use", "Hazardous alcohol use")
+cp_obese_n   <- get_plot(subgroup_results_csph, "Obesity",              "Not obese (BMI < 30)")
+cp_obese_y   <- get_plot(subgroup_results_csph, "Obesity",              "Obese (BMI \u2265 30)")
+
+all_needed_csph <- list(cp_gender_m, cp_gender_f, cp_abor_i, cp_abor_n, cp_hiv_n, cp_hiv_p, cp_hbv_n, cp_hbv_p, cp_haz_n, cp_haz_y, cp_obese_n, cp_obese_y)
+if (!any(map_lgl(all_needed_csph, is.null))) {
+  cp_gender_f <- cp_gender_f + theme(legend.position = "none")
+  cp_abor_i   <- cp_abor_i   + theme(legend.position = "none")
+  cp_abor_n   <- cp_abor_n   + theme(legend.position = "none")
+  cp_hiv_n    <- cp_hiv_n    + theme(legend.position = "none")
+  cp_hiv_p    <- cp_hiv_p    + theme(legend.position = "none")
+  cp_hbv_n    <- cp_hbv_n    + theme(legend.position = "none")
+  cp_hbv_p    <- cp_hbv_p    + theme(legend.position = "none")
+  cp_haz_n    <- cp_haz_n    + theme(legend.position = "none")
+  cp_haz_y    <- cp_haz_y    + theme(legend.position = "none")
+  cp_obese_n  <- cp_obese_n  + theme(legend.position = "none")
+  cp_obese_y  <- cp_obese_y  + theme(legend.position = "none")
+
+  combined_csph <- wrap_plots(
+    list(
+      (cp_gender_m | cp_gender_f),
+      (cp_abor_i   | cp_abor_n),
+      (cp_hiv_n    | cp_hiv_p),
+      (cp_hbv_n    | cp_hbv_p),
+      (cp_haz_n    | cp_haz_y),
+      (cp_obese_n  | cp_obese_y)
+    ),
+    ncol = 2
+  ) +
+    plot_layout(guides = "collect") &
+    theme(legend.position = "bottom")
+
+  ggsave("Results/Subgroup/DCA_CSPH_Subgroup_All_Panels.png", plot = combined_csph, width = 14, height = 14, dpi = 300)
+}
+
+# NIA combined (CSPH outcome)
+np_c_gender_m  <- get_nia_plot(subgroup_results_csph, "Gender",               "Male")
+np_c_gender_f  <- get_nia_plot(subgroup_results_csph, "Gender",               "Female")
+np_c_abor_i    <- get_nia_plot(subgroup_results_csph, "Aboriginal",           "Aboriginal and/or\nTorres Strait Islander")
+np_c_abor_n    <- get_nia_plot(subgroup_results_csph, "Aboriginal",           "Non-Indigenous")
+np_c_hiv_n     <- get_nia_plot(subgroup_results_csph, "HIV",                  "No HIV infection")
+np_c_hiv_p     <- get_nia_plot(subgroup_results_csph, "HIV",                  "HIV infection")
+np_c_hbv_n     <- get_nia_plot(subgroup_results_csph, "HBV",                  "No HBV infection")
+np_c_hbv_p     <- get_nia_plot(subgroup_results_csph, "HBV",                  "HBV infection")
+np_c_haz_n     <- get_nia_plot(subgroup_results_csph, "Hazardous alcohol use", "No hazardous alcohol use")
+np_c_haz_y     <- get_nia_plot(subgroup_results_csph, "Hazardous alcohol use", "Hazardous alcohol use")
+np_c_obese_n   <- get_nia_plot(subgroup_results_csph, "Obesity",              "Not obese (BMI < 30)")
+np_c_obese_y   <- get_nia_plot(subgroup_results_csph, "Obesity",              "Obese (BMI \u2265 30)")
+
+nia_needed_csph <- list(np_c_gender_m, np_c_gender_f, np_c_abor_i, np_c_abor_n, np_c_hiv_n, np_c_hiv_p, np_c_hbv_n, np_c_hbv_p, np_c_haz_n, np_c_haz_y, np_c_obese_n, np_c_obese_y)
+if (!any(map_lgl(nia_needed_csph, is.null))) {
+  np_c_gender_f <- np_c_gender_f + theme(legend.position = "none")
+  np_c_abor_i   <- np_c_abor_i   + theme(legend.position = "none")
+  np_c_abor_n   <- np_c_abor_n   + theme(legend.position = "none")
+  np_c_hiv_n    <- np_c_hiv_n    + theme(legend.position = "none")
+  np_c_hiv_p    <- np_c_hiv_p    + theme(legend.position = "none")
+  np_c_hbv_n    <- np_c_hbv_n    + theme(legend.position = "none")
+  np_c_hbv_p    <- np_c_hbv_p    + theme(legend.position = "none")
+  np_c_haz_n    <- np_c_haz_n    + theme(legend.position = "none")
+  np_c_haz_y    <- np_c_haz_y    + theme(legend.position = "none")
+  np_c_obese_n  <- np_c_obese_n  + theme(legend.position = "none")
+  np_c_obese_y  <- np_c_obese_y  + theme(legend.position = "none")
+
+  nia_combined_csph <- wrap_plots(
+    list(
+      (np_c_gender_m | np_c_gender_f),
+      (np_c_abor_i   | np_c_abor_n),
+      (np_c_hiv_n    | np_c_hiv_p),
+      (np_c_hbv_n    | np_c_hbv_p),
+      (np_c_haz_n    | np_c_haz_y),
+      (np_c_obese_n  | np_c_obese_y)
+    ),
+    ncol = 2
+  ) +
+    plot_layout(guides = "collect") &
+    theme(legend.position = "bottom")
+
+  ggsave("Results/Subgroup/NIA_CSPH_Subgroup_All_Panels.png", plot = nia_combined_csph, width = 14, height = 14, dpi = 300)
+}
+
+subgroup_results_csph %>% select(-plot, -nia_plot)
+```

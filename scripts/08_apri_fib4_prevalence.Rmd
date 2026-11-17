@@ -1,0 +1,1055 @@
+---
+title: "APRI and FIB-4 Availability and Prevalence"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(pacman)
+dir.create("Results/Descriptives", recursive = TRUE, showWarnings = FALSE)
+dir.create("Results/DCA", recursive = TRUE, showWarnings = FALSE)
+dir.create("Results/Metaanalysis", recursive = TRUE, showWarnings = FALSE)
+p_load(tidyverse, scales, knitr, metafor, dcurves, patchwork)
+```
+
+```{r helpers, include=FALSE}
+inv_logit <- function(x) 1 / (1 + exp(-x))
+
+fit_re_meta <- function(yi, vi) {
+  if (length(yi) < 2) return(NULL)
+  tryCatch(
+    metafor::rma(yi = yi, vi = vi, method = "REML"),
+    error = function(e) NULL
+  )
+}
+
+extract_meta_stats <- function(model) {
+  if (is.null(model)) {
+    return(tibble(
+      pooled = NA_real_,
+      ci_lb = NA_real_,
+      ci_ub = NA_real_,
+      pi_lb = NA_real_,
+      pi_ub = NA_real_,
+      tau2 = NA_real_,
+      i2 = NA_real_,
+      q = NA_real_,
+      q_p = NA_real_,
+      k = NA_integer_
+    ))
+  }
+
+  pred <- metafor::predict.rma(model)
+
+  tibble(
+    pooled = unname(pred$pred),
+    ci_lb = unname(pred$ci.lb),
+    ci_ub = unname(pred$ci.ub),
+    pi_lb = unname(pred$pi.lb),
+    pi_ub = unname(pred$pi.ub),
+    tau2 = unname(model$tau2),
+    i2 = unname(model$I2),
+    q = unname(model$QE),
+    q_p = unname(model$QEp),
+    k = unname(model$k)
+  )
+}
+
+format_p <- function(p) {
+  ifelse(is.na(p), NA_character_, ifelse(p < 0.001, "<0.001", formatC(p, digits = 3, format = "f")))
+}
+
+net_benefit_binary <- function(treat, outcome, pt, harm = 0) {
+  treat <- as.integer(treat)
+  outcome <- as.integer(outcome)
+
+  keep <- !is.na(treat) & !is.na(outcome)
+  treat <- treat[keep]
+  outcome <- outcome[keep]
+
+  n <- length(outcome)
+  if (n == 0) return(NA_real_)
+
+  w <- pt / (1 - pt)
+  tp <- sum(treat == 1 & outcome == 1)
+  fp <- sum(treat == 1 & outcome == 0)
+
+  (tp / n) - (fp / n) * w - harm
+}
+
+net_benefit_pathway <- function(referral, outcome, pt, tested = NULL, test_harm = 0) {
+  referral <- as.integer(referral)
+  outcome <- as.integer(outcome)
+
+  if (is.null(tested)) {
+    tested <- rep(0L, length(referral))
+  }
+
+  tested <- as.integer(tested)
+
+  keep <- !is.na(referral) & !is.na(outcome) & !is.na(tested)
+  referral <- referral[keep]
+  outcome <- outcome[keep]
+  tested <- tested[keep]
+
+  n <- length(outcome)
+  if (n == 0) return(NA_real_)
+
+  w <- pt / (1 - pt)
+  tp <- sum(referral == 1 & outcome == 1)
+  fp <- sum(referral == 1 & outcome == 0)
+  testing_harm <- mean(tested == 1) * test_harm
+
+  (tp / n) - (fp / n) * w - testing_harm
+}
+
+nb_screen_all <- function(outcome, pt) {
+  outcome <- as.integer(outcome)
+  outcome <- outcome[!is.na(outcome)]
+  n <- length(outcome)
+  if (n == 0) return(NA_real_)
+
+  prev <- mean(outcome)
+  w <- pt / (1 - pt)
+  prev - (1 - prev) * w
+}
+```
+
+# Load Data
+
+```{r}
+df <- read_csv("Data/merged_data.csv", show_col_types = FALSE)
+
+cat("Analysis cohort N:", nrow(df), "\n")
+cat("Studies in analysis cohort:", n_distinct(df$study), "\n")
+```
+
+# Variable Availability by Study
+
+This table uses the merged analysis cohort and shows how many participants in each study
+have the variables required to compute APRI and FIB-4.
+
+```{r}
+availability_tbl <- df %>%
+  mutate(
+    has_age = !is.na(age),
+    has_ast = !is.na(ast),
+    has_alt = !is.na(alt),
+    has_platelets = !is.na(platelets),
+    can_compute_apri = has_ast & has_platelets & platelets > 0,
+    can_compute_fib4 = has_age & has_ast & has_alt & has_platelets & alt > 0 & platelets > 0
+  ) %>%
+  group_by(study) %>%
+  summarise(
+    n_analysis = n(),
+    n_age = sum(has_age),
+    n_ast = sum(has_ast),
+    n_alt = sum(has_alt),
+    n_platelets = sum(has_platelets),
+    n_apri_available = sum(can_compute_apri),
+    pct_apri_available = n_apri_available / n_analysis,
+    n_fib4_available = sum(can_compute_fib4),
+    pct_fib4_available = n_fib4_available / n_analysis,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    apri_available = paste0(n_apri_available, " (", percent(pct_apri_available, accuracy = 0.1), ")"),
+    fib4_available = paste0(n_fib4_available, " (", percent(pct_fib4_available, accuracy = 0.1), ")")
+  ) %>%
+  arrange(desc(n_apri_available), desc(n_fib4_available), study)
+
+write_csv(availability_tbl, "Results/Descriptives/APRI_FIB4_StudyAvailability.csv")
+
+availability_tbl %>%
+  select(
+    study,
+    n_analysis,
+    n_age,
+    n_ast,
+    n_alt,
+    n_platelets,
+    apri_available,
+    fib4_available
+  ) %>%
+  kable()
+```
+
+# Recompute APRI and FIB-4
+
+The formulas below match the derivation used in the merge script.
+
+```{r}
+df_scores <- df %>%
+  mutate(
+    apri_recalc = case_when(
+      !is.na(ast) & !is.na(platelets) & platelets > 0 ~ (ast / 40) / (platelets / 100),
+      TRUE ~ NA_real_
+    ),
+    fib4_recalc = case_when(
+      !is.na(age) & !is.na(ast) & !is.na(alt) & !is.na(platelets) & alt > 0 & platelets > 0 ~
+        (age * ast) / (platelets * sqrt(alt)),
+      TRUE ~ NA_real_
+    )
+  )
+
+score_check <- tibble(
+  metric = c("APRI", "FIB-4"),
+  n_available = c(sum(!is.na(df_scores$apri_recalc)), sum(!is.na(df_scores$fib4_recalc))),
+  n_matching_existing = c(
+    sum(abs(df_scores$apri_recalc - df_scores$apri) < 1e-8, na.rm = TRUE),
+    sum(abs(df_scores$fib4_recalc - df_scores$fib4) < 1e-8, na.rm = TRUE)
+  )
+)
+
+score_check %>% kable()
+```
+
+# Positive Screen Prevalence at Requested Cutoffs
+
+Positive screen is defined as score greater than or equal to the cutoff.
+
+```{r}
+summarise_positive_prevalence <- function(data, score_var, cutoffs, marker_name) {
+  score_sym <- rlang::sym(score_var)
+
+  bind_rows(lapply(cutoffs, function(cutoff) {
+    by_study <- data %>%
+      filter(!is.na(!!score_sym)) %>%
+      group_by(study) %>%
+      summarise(
+        marker = marker_name,
+        cutoff = cutoff,
+        denominator = n(),
+        positive_n = sum((!!score_sym) >= cutoff),
+        prevalence = positive_n / denominator,
+        .groups = "drop"
+      )
+
+    overall <- data %>%
+      filter(!is.na(!!score_sym)) %>%
+      summarise(
+        study = "Overall",
+        marker = marker_name,
+        cutoff = cutoff,
+        denominator = n(),
+        positive_n = sum((!!score_sym) >= cutoff),
+        prevalence = positive_n / denominator
+      )
+
+    bind_rows(overall, by_study)
+  })) %>%
+    mutate(
+      cutoff_label = paste0(">=", cutoff),
+      prevalence_pct = percent(prevalence, accuracy = 0.1)
+    )
+}
+
+apri_prev_tbl <- summarise_positive_prevalence(
+  data = df_scores,
+  score_var = "apri_recalc",
+  cutoffs = c(0.5, 1.0, 2.0),
+  marker_name = "APRI"
+)
+
+fib4_prev_tbl <- summarise_positive_prevalence(
+  data = df_scores,
+  score_var = "fib4_recalc",
+  cutoffs = c(1.45),
+  marker_name = "FIB-4"
+)
+
+positive_prev_tbl <- bind_rows(apri_prev_tbl, fib4_prev_tbl) %>%
+  arrange(marker, cutoff, study)
+
+write_csv(apri_prev_tbl, "Results/Descriptives/APRI_PositiveScreenPrevalence.csv")
+write_csv(fib4_prev_tbl, "Results/Descriptives/FIB4_PositiveScreenPrevalence.csv")
+write_csv(positive_prev_tbl, "Results/Descriptives/APRI_FIB4_PositiveScreenPrevalence.csv")
+
+positive_prev_tbl %>%
+  select(marker, cutoff_label, study, denominator, positive_n, prevalence_pct) %>%
+  kable()
+```
+
+# Clinical Pathway Decision Curve Analysis
+
+This is the primary decision curve analysis for clinical pathways rather than standalone predictors.
+This figure focuses only on age-gated biomarker pathways, shown separately for APRI and FIB-4.
+Each panel has its own legend so the age-cutoff ordering is easier to read.
+
+```{r}
+threshold_grid <- seq(0, 0.5, by = 0.01)
+
+df_dca_pathways <- df_scores %>%
+  filter(!is.na(fsm), !is.na(age), !is.na(apri_recalc), !is.na(fib4_recalc)) %>%
+  mutate(
+    outcome_cirrhosis = if_else(fsm >= 12.5, 1, 0)
+  )
+
+n_pathway <- nrow(df_dca_pathways)
+
+cat("Clinical pathway DCA cohort N:", n_pathway, "\n")
+
+pathway_defs <- tibble(
+  marker = c(
+    "FibroScan pathways",
+    "FibroScan pathways",
+    "FibroScan pathways",
+    "APRI pathways",
+    "APRI pathways",
+    "APRI pathways",
+    "FIB-4 pathways",
+    "FIB-4 pathways",
+    "FIB-4 pathways"
+  ),
+  label = c(
+    "Age > 35 then FibroScan",
+    "Age > 40 then FibroScan",
+    "Age > 45 then FibroScan",
+    "Age > 35 then APRI >= 1.0",
+    "Age > 40 then APRI >= 1.0",
+    "Age > 45 then APRI >= 1.0",
+    "Age > 35 then FIB-4 >= 1.45",
+    "Age > 40 then FIB-4 >= 1.45",
+    "Age > 45 then FIB-4 >= 1.45"
+  ),
+  referral = list(
+    df_dca_pathways$age > 35,
+    df_dca_pathways$age > 40,
+    df_dca_pathways$age > 45,
+    df_dca_pathways$age > 35 & df_dca_pathways$apri_recalc >= 1.0,
+    df_dca_pathways$age > 40 & df_dca_pathways$apri_recalc >= 1.0,
+    df_dca_pathways$age > 45 & df_dca_pathways$apri_recalc >= 1.0,
+    df_dca_pathways$age > 35 & df_dca_pathways$fib4_recalc >= 1.45,
+    df_dca_pathways$age > 40 & df_dca_pathways$fib4_recalc >= 1.45,
+    df_dca_pathways$age > 45 & df_dca_pathways$fib4_recalc >= 1.45
+  ),
+  tested = list(
+    rep(0L, nrow(df_dca_pathways)),
+    rep(0L, nrow(df_dca_pathways)),
+    rep(0L, nrow(df_dca_pathways)),
+    as.integer(df_dca_pathways$age > 35),
+    as.integer(df_dca_pathways$age > 40),
+    as.integer(df_dca_pathways$age > 45),
+    as.integer(df_dca_pathways$age > 35),
+    as.integer(df_dca_pathways$age > 40),
+    as.integer(df_dca_pathways$age > 45)
+  )
+)
+
+if (nrow(df_dca_pathways) > 0) {
+  pathway_dca_tbl <- tibble(threshold = threshold_grid) %>%
+    group_by(threshold) %>%
+    group_modify(~ {
+      pt <- .y$threshold[[1]]
+      outcome <- df_dca_pathways$outcome_cirrhosis
+
+      reference_rows <- tibble(
+        marker = c(
+          "FibroScan pathways",
+          "FibroScan pathways",
+          "APRI pathways",
+          "APRI pathways",
+          "FIB-4 pathways",
+          "FIB-4 pathways"
+        ),
+        label = c(
+          "Universal FibroScan",
+          "Screen None",
+          "Universal APRI >= 1.0",
+          "Screen None",
+          "Universal FIB-4 >= 1.45",
+          "Screen None"
+        ),
+        net_benefit = c(
+          net_benefit_pathway(
+            referral = rep(1L, nrow(df_dca_pathways)),
+            outcome = outcome,
+            pt = pt,
+            tested = rep(0L, nrow(df_dca_pathways)),
+            test_harm = 0
+          ),
+          0,
+          net_benefit_pathway(
+            referral = df_dca_pathways$apri_recalc >= 1.0,
+            outcome = outcome,
+            pt = pt,
+            tested = rep(1L, nrow(df_dca_pathways)),
+            test_harm = 0
+          ),
+          0,
+          net_benefit_pathway(
+            referral = df_dca_pathways$fib4_recalc >= 1.45,
+            outcome = outcome,
+            pt = pt,
+            tested = rep(1L, nrow(df_dca_pathways)),
+            test_harm = 0
+          ),
+          0
+        )
+      )
+
+      strategy_rows <- pathway_defs %>%
+        mutate(
+          net_benefit = purrr::map2_dbl(
+            referral,
+            tested,
+            ~ net_benefit_pathway(.x, outcome, pt, tested = .y, test_harm = 0)
+          )
+        ) %>%
+        select(marker, label, net_benefit)
+
+      bind_rows(reference_rows, strategy_rows)
+    }) %>%
+    ungroup() %>%
+    mutate(
+      label = factor(
+        label,
+        levels = c(
+          "Universal FibroScan",
+          "Universal APRI >= 1.0",
+          "Universal FIB-4 >= 1.45",
+          "Screen None",
+          "Age > 35 then FibroScan",
+          "Age > 40 then FibroScan",
+          "Age > 45 then FibroScan",
+          "Age > 35 then APRI >= 1.0",
+          "Age > 40 then APRI >= 1.0",
+          "Age > 45 then APRI >= 1.0",
+          "Age > 35 then FIB-4 >= 1.45",
+          "Age > 40 then FIB-4 >= 1.45",
+          "Age > 45 then FIB-4 >= 1.45"
+        )
+      )
+    )
+
+  write_csv(pathway_dca_tbl, "Results/DCA/DCA_Clinical_Pathways_Cirrhosis_Data.csv")
+
+  fibroscan_palette <- c(
+    "Universal FibroScan" = "black",
+    "Screen None" = "black",
+    "Age > 35 then FibroScan" = "#1b9e77",
+    "Age > 40 then FibroScan" = "#66a61e",
+    "Age > 45 then FibroScan" = "#a6d854"
+  )
+
+  apri_palette <- c(
+    "Universal APRI >= 1.0" = "black",
+    "Screen None" = "black",
+    "Age > 35 then APRI >= 1.0" = "#d95f02",
+    "Age > 40 then APRI >= 1.0" = "#fc8d62",
+    "Age > 45 then APRI >= 1.0" = "#fddbc7"
+  )
+
+  fib4_palette <- c(
+    "Universal FIB-4 >= 1.45" = "black",
+    "Screen None" = "black",
+    "Age > 35 then FIB-4 >= 1.45" = "#1f78b4",
+    "Age > 40 then FIB-4 >= 1.45" = "#74add1",
+    "Age > 45 then FIB-4 >= 1.45" = "#d1e5f0"
+  )
+
+  fibroscan_plot <- pathway_dca_tbl %>%
+    filter(marker == "FibroScan pathways") %>%
+    ggplot(aes(x = threshold, y = net_benefit, color = label, linetype = label)) +
+    geom_line(linewidth = 0.9) +
+    scale_x_continuous(limits = c(0, 0.3), labels = scales::percent) +
+    scale_y_continuous(limits = c(-0.025, 0.1)) +
+    scale_linetype_manual(
+      values = c(
+        "Universal FibroScan" = "solid",
+        "Screen None" = "dotted",
+        "Age > 35 then FibroScan" = "solid",
+        "Age > 40 then FibroScan" = "solid",
+        "Age > 45 then FibroScan" = "solid"
+      )
+    ) +
+    scale_color_manual(values = fibroscan_palette) +
+    theme_minimal() +
+    labs(
+      title = paste0("Original FibroScan strategy (n = ", n_pathway, ")"),
+      x = "Threshold Probability",
+      y = "Net Benefit",
+      color = "Strategy",
+      linetype = "Strategy"
+    )
+
+  apri_plot <- pathway_dca_tbl %>%
+    filter(marker == "APRI pathways") %>%
+    ggplot(aes(x = threshold, y = net_benefit, color = label, linetype = label)) +
+    geom_line(linewidth = 0.9) +
+    scale_x_continuous(limits = c(0, 0.3), labels = scales::percent) +
+    scale_y_continuous(limits = c(-0.025, 0.1)) +
+    scale_linetype_manual(
+      values = c(
+        "Universal APRI >= 1.0" = "solid",
+        "Screen None" = "dotted",
+        "Age > 35 then APRI >= 1.0" = "solid",
+        "Age > 40 then APRI >= 1.0" = "solid",
+        "Age > 45 then APRI >= 1.0" = "solid"
+      )
+    ) +
+    scale_color_manual(values = apri_palette) +
+    theme_minimal() +
+    labs(
+      title = paste0("Age-gated two-step APRI strategy (n = ", n_pathway, ")"),
+      x = "Threshold Probability",
+      y = "Net Benefit",
+      color = "Strategy",
+      linetype = "Strategy"
+    )
+
+  fib4_plot <- pathway_dca_tbl %>%
+    filter(marker == "FIB-4 pathways") %>%
+    ggplot(aes(x = threshold, y = net_benefit, color = label, linetype = label)) +
+    geom_line(linewidth = 0.9) +
+    scale_x_continuous(limits = c(0, 0.3), labels = scales::percent) +
+    scale_y_continuous(limits = c(-0.025, 0.1)) +
+    scale_linetype_manual(
+      values = c(
+        "Universal FIB-4 >= 1.45" = "solid",
+        "Screen None" = "dotted",
+        "Age > 35 then FIB-4 >= 1.45" = "solid",
+        "Age > 40 then FIB-4 >= 1.45" = "solid",
+        "Age > 45 then FIB-4 >= 1.45" = "solid"
+      )
+    ) +
+    scale_color_manual(values = fib4_palette) +
+    theme_minimal() +
+    labs(
+      title = paste0("Age-gated two-step FIB-4 strategy (n = ", n_pathway, ")"),
+      x = "Threshold Probability",
+      y = "Net Benefit",
+      color = "Strategy",
+      linetype = "Strategy"
+    )
+
+  combined_pathway_plot <- fibroscan_plot / apri_plot / fib4_plot
+
+  ggsave("Results/DCA/DCA_Clinical_Pathways_Cirrhosis.png", combined_pathway_plot, width = 10, height = 18, dpi = 300)
+
+  combined_single_panel_palette <- c(
+    "Universal FibroScan" = "darkgreen",
+    "Universal APRI >= 1.0" = "#b15928",
+    "Universal FIB-4 >= 1.45" = "#1f78b4",
+    "Screen None" = "black",
+    "Age > 35 then FibroScan" = "#1b9e77",
+    "Age > 40 then FibroScan" = "#66a61e",
+    "Age > 45 then FibroScan" = "#a6d854",
+    "Age > 35 then APRI >= 1.0" = "#d95f02",
+    "Age > 40 then APRI >= 1.0" = "#fc8d62",
+    "Age > 45 then APRI >= 1.0" = "#fddbc7",
+    "Age > 35 then FIB-4 >= 1.45" = "#1f78b4",
+    "Age > 40 then FIB-4 >= 1.45" = "#74add1",
+    "Age > 45 then FIB-4 >= 1.45" = "#d1e5f0"
+  )
+
+  combined_single_panel_linetypes <- c(
+    "Universal FibroScan" = "dashed",
+    "Universal APRI >= 1.0" = "dashed",
+    "Universal FIB-4 >= 1.45" = "dashed",
+    "Screen None" = "solid",
+    "Age > 35 then FibroScan" = "solid",
+    "Age > 40 then FibroScan" = "solid",
+    "Age > 45 then FibroScan" = "solid",
+    "Age > 35 then APRI >= 1.0" = "solid",
+    "Age > 40 then APRI >= 1.0" = "solid",
+    "Age > 45 then APRI >= 1.0" = "solid",
+    "Age > 35 then FIB-4 >= 1.45" = "solid",
+    "Age > 40 then FIB-4 >= 1.45" = "solid",
+    "Age > 45 then FIB-4 >= 1.45" = "solid"
+  )
+
+  combined_single_panel_order <- c(
+    "Universal FibroScan",
+    "Universal APRI >= 1.0",
+    "Universal FIB-4 >= 1.45",
+    "Screen None",
+    "Age > 35 then FibroScan",
+    "Age > 40 then FibroScan",
+    "Age > 45 then FibroScan",
+    "Age > 35 then APRI >= 1.0",
+    "Age > 40 then APRI >= 1.0",
+    "Age > 45 then APRI >= 1.0",
+    "Age > 35 then FIB-4 >= 1.45",
+    "Age > 40 then FIB-4 >= 1.45",
+    "Age > 45 then FIB-4 >= 1.45"
+  )
+
+  pathway_dca_tbl_single_panel <- pathway_dca_tbl %>%
+    mutate(label = factor(as.character(label), levels = combined_single_panel_order))
+
+  write_csv(pathway_dca_tbl_single_panel, "Results/DCA/DCA_Clinical_Pathways_AllOnOne_Cirrhosis_Data.csv")
+
+  combined_single_panel_plot <- pathway_dca_tbl_single_panel %>%
+    ggplot(aes(x = threshold, y = net_benefit, color = label, linetype = label)) +
+    geom_line(linewidth = 0.9) +
+    scale_x_continuous(limits = c(0, 0.3), labels = scales::percent) +
+    scale_y_continuous(limits = c(-0.025, 0.1)) +
+    scale_color_manual(values = combined_single_panel_palette, drop = FALSE) +
+    scale_linetype_manual(values = combined_single_panel_linetypes, drop = FALSE) +
+    theme_minimal() +
+    labs(
+      title = paste0("Combined clinical pathways (n = ", n_pathway, ")"),
+      x = "Threshold Probability",
+      y = "Net Benefit",
+      color = "Strategy",
+      linetype = "Strategy"
+    )
+
+  ggsave("Results/DCA/DCA_Clinical_Pathways_AllOnOne_Cirrhosis.png", combined_single_panel_plot, width = 10, height = 7, dpi = 300)
+
+  apri_cutoff_defs <- tidyr::crossing(
+    cutoff = c(0.5, 1.0, 2.0),
+    age_cutoff = c(35, 40, 45)
+  ) %>%
+    mutate(
+      cutoff_label = formatC(cutoff, format = "f", digits = 1),
+      panel = paste0("APRI >= ", cutoff_label),
+      label = paste0("Age > ", age_cutoff, " then APRI >= ", cutoff_label),
+      referral = purrr::map2(age_cutoff, cutoff, ~ df_dca_pathways$age > .x & df_dca_pathways$apri_recalc >= .y),
+      tested = purrr::map(age_cutoff, ~ as.integer(df_dca_pathways$age > .x))
+    )
+
+  apri_cutoff_dca_tbl <- tibble(threshold = threshold_grid) %>%
+    group_by(threshold) %>%
+    group_modify(~ {
+      pt <- .y$threshold[[1]]
+      outcome <- df_dca_pathways$outcome_cirrhosis
+
+      reference_rows <- tibble(
+        panel = rep(paste0("APRI >= ", formatC(c(0.5, 1.0, 2.0), format = "f", digits = 1)), each = 2),
+        label = rep(c("Universal APRI", "Screen None"), times = 3),
+        net_benefit = c(
+          net_benefit_pathway(df_dca_pathways$apri_recalc >= 0.5, outcome, pt, tested = rep(1L, nrow(df_dca_pathways)), test_harm = 0),
+          0,
+          net_benefit_pathway(df_dca_pathways$apri_recalc >= 1.0, outcome, pt, tested = rep(1L, nrow(df_dca_pathways)), test_harm = 0),
+          0,
+          net_benefit_pathway(df_dca_pathways$apri_recalc >= 2.0, outcome, pt, tested = rep(1L, nrow(df_dca_pathways)), test_harm = 0),
+          0
+        )
+      )
+
+      strategy_rows <- apri_cutoff_defs %>%
+        mutate(
+          net_benefit = purrr::map2_dbl(
+            referral,
+            tested,
+            ~ net_benefit_pathway(.x, outcome, pt, tested = .y, test_harm = 0)
+          )
+        ) %>%
+        select(panel, label, net_benefit)
+
+      bind_rows(reference_rows, strategy_rows)
+    }) %>%
+    ungroup() %>%
+    mutate(
+      label = factor(
+        label,
+        levels = c(
+          "Universal APRI",
+          "Screen None",
+          "Age > 35 then APRI >= 0.5",
+          "Age > 40 then APRI >= 0.5",
+          "Age > 45 then APRI >= 0.5",
+          "Age > 35 then APRI >= 1.0",
+          "Age > 40 then APRI >= 1.0",
+          "Age > 45 then APRI >= 1.0",
+          "Age > 35 then APRI >= 2.0",
+          "Age > 40 then APRI >= 2.0",
+          "Age > 45 then APRI >= 2.0"
+        )
+      ),
+      panel = factor(panel, levels = c("APRI >= 0.5", "APRI >= 1.0", "APRI >= 2.0"))
+    )
+
+  write_csv(apri_cutoff_dca_tbl, "Results/DCA/DCA_APRI_CutoffPathways_Cirrhosis_Data.csv")
+
+  apri_cutoff_palette <- c(
+    "Universal APRI" = "black",
+    "Screen None" = "black",
+    "Age > 35 then APRI >= 0.5" = "#b35806",
+    "Age > 40 then APRI >= 0.5" = "#e08214",
+    "Age > 45 then APRI >= 0.5" = "#fdb863",
+    "Age > 35 then APRI >= 1.0" = "#d95f02",
+    "Age > 40 then APRI >= 1.0" = "#fc8d62",
+    "Age > 45 then APRI >= 1.0" = "#fddbc7",
+    "Age > 35 then APRI >= 2.0" = "#7f3b08",
+    "Age > 40 then APRI >= 2.0" = "#b35806",
+    "Age > 45 then APRI >= 2.0" = "#e08214"
+  )
+
+  apri_cutoff_plot <- apri_cutoff_dca_tbl %>%
+    ggplot(aes(x = threshold, y = net_benefit, color = label, linetype = label)) +
+    geom_line(linewidth = 0.9) +
+    facet_wrap(~ panel, ncol = 1) +
+    scale_x_continuous(limits = c(0, 0.3), labels = scales::percent) +
+    scale_y_continuous(limits = c(-0.025, 0.1)) +
+    scale_color_manual(values = apri_cutoff_palette, drop = FALSE) +
+    scale_linetype_manual(
+      values = c(
+        "Universal APRI" = "dashed",
+        "Screen None" = "solid",
+        "Age > 35 then APRI >= 0.5" = "solid",
+        "Age > 40 then APRI >= 0.5" = "solid",
+        "Age > 45 then APRI >= 0.5" = "solid",
+        "Age > 35 then APRI >= 1.0" = "solid",
+        "Age > 40 then APRI >= 1.0" = "solid",
+        "Age > 45 then APRI >= 1.0" = "solid",
+        "Age > 35 then APRI >= 2.0" = "solid",
+        "Age > 40 then APRI >= 2.0" = "solid",
+        "Age > 45 then APRI >= 2.0" = "solid"
+      ),
+      drop = FALSE
+    ) +
+    theme_minimal() +
+    labs(
+      title = paste0("Age-gated APRI pathways across cutoffs (n = ", n_pathway, ")"),
+      x = "Threshold Probability",
+      y = "Net Benefit",
+      color = "Strategy",
+      linetype = "Strategy"
+    )
+
+  ggsave("Results/DCA/DCA_APRI_CutoffPathways_Cirrhosis.png", apri_cutoff_plot, width = 10, height = 14, dpi = 300)
+
+  pathway_snapshot_tbl <- pathway_dca_tbl %>%
+    filter(abs(threshold - 0.10) < 1e-9) %>%
+    arrange(marker, desc(net_benefit))
+
+  pathway_snapshot_tbl %>%
+    kable(digits = 3)
+} else {
+  cat("Not enough biomarker-complete data for clinical pathway decision curve analysis.\n")
+}
+```
+
+# Standalone Referral-rule Sensitivity Analyses
+
+The sections below keep the one-step referral-rule DCAs for sensitivity only.
+They compare standalone rules rather than full clinical pathways.
+
+# Decision Curve Analysis Comparing Biomarkers
+
+This decision curve analysis compares biomarker-based screen strategies for cirrhosis,
+defined as FibroScan $\ge$ 12.5 kPa, using the matched subset with all biomarker values available.
+
+```{r}
+df_dca_biomarkers <- df_scores %>%
+  filter(!is.na(fsm), !is.na(apri_recalc), !is.na(fib4_recalc)) %>%
+  mutate(
+    outcome_cirrhosis = if_else(fsm >= 12.5, 1, 0),
+    strategy_apri_0_5 = if_else(apri_recalc >= 0.5, 1, 0),
+    strategy_apri_1_0 = if_else(apri_recalc >= 1.0, 1, 0),
+    strategy_apri_2_0 = if_else(apri_recalc >= 2.0, 1, 0),
+    strategy_fib4_1_45 = if_else(fib4_recalc >= 1.45, 1, 0)
+  )
+
+cat("Matched biomarker DCA cohort N:", nrow(df_dca_biomarkers), "\n")
+
+if (nrow(df_dca_biomarkers) > 0) {
+  dca_biomarker_result <- dca(
+    formula = outcome_cirrhosis ~ strategy_apri_0_5 + strategy_apri_1_0 + strategy_apri_2_0 + strategy_fib4_1_45,
+    data = df_dca_biomarkers,
+    thresholds = seq(0, 0.5, by = 0.01),
+    label = list(
+      strategy_apri_0_5 = "APRI >= 0.5",
+      strategy_apri_1_0 = "APRI >= 1.0",
+      strategy_apri_2_0 = "APRI >= 2.0",
+      strategy_fib4_1_45 = "FIB-4 >= 1.45"
+    )
+  )
+
+  dca_biomarker_tbl <- dca_biomarker_result %>%
+    as_tibble() %>%
+    mutate(label = str_replace(label, "Treat All", "Screen All")) %>%
+    mutate(label = str_replace(label, "Treat None", "Screen None"))
+
+  write_csv(dca_biomarker_tbl, "Results/DCA/DCA_Biomarker_Strategies_Data.csv")
+
+  dca_biomarker_tbl %>%
+    ggplot(aes(x = threshold, y = net_benefit, color = label, linetype = label)) +
+    geom_line(linewidth = 1) +
+    scale_x_continuous(limits = c(0, 0.3), labels = scales::percent) +
+    scale_y_continuous(limits = c(-0.01, NA)) +
+    scale_linetype_manual(
+      values = c(
+        "Screen All" = "solid",
+        "Screen None" = "dotted",
+        "APRI >= 0.5" = "solid",
+        "APRI >= 1.0" = "solid",
+        "APRI >= 2.0" = "solid",
+        "FIB-4 >= 1.45" = "solid"
+      )
+    ) +
+    scale_color_manual(
+      values = c(
+        "Screen All" = "black",
+        "Screen None" = "black",
+        "APRI >= 0.5" = "#1b9e77",
+        "APRI >= 1.0" = "#d95f02",
+        "APRI >= 2.0" = "#7570b3",
+        "FIB-4 >= 1.45" = "#e7298a"
+      )
+    ) +
+    theme_minimal() +
+    labs(
+      title = "Decision Curve Analysis: Biomarker Strategies for Detecting Cirrhosis",
+      x = "Threshold Probability",
+      y = "Net Benefit",
+      color = "Strategy",
+      linetype = "Strategy"
+    )
+
+  ggsave("Results/DCA/DCA_Biomarker_Strategies_Cirrhosis.png", width = 8, height = 5, dpi = 300)
+
+  dca_biomarker_tbl %>%
+    select(threshold, label, net_benefit) %>%
+    kable(digits = 3)
+} else {
+  cat("Not enough matched biomarker data for decision curve analysis.\n")
+}
+```
+
+# Decision Curve Analysis Comparing Age-based Strategies
+
+This companion figure uses the same matched biomarker DCA cohort so that age-based strategies
+can be compared against the biomarker figure on the same participants.
+
+```{r}
+df_dca_age <- df_dca_biomarkers %>%
+  mutate(
+    strategy_age35 = if_else(age > 35, 1, 0),
+    strategy_age40 = if_else(age > 40, 1, 0),
+    strategy_age45 = if_else(age > 45, 1, 0)
+  )
+
+if (nrow(df_dca_age) > 0) {
+  dca_age_result <- dca(
+    formula = outcome_cirrhosis ~ strategy_age35 + strategy_age40 + strategy_age45,
+    data = df_dca_age,
+    thresholds = seq(0, 0.5, by = 0.01),
+    label = list(
+      strategy_age35 = "Age > 35",
+      strategy_age40 = "Age > 40",
+      strategy_age45 = "Age > 45"
+    )
+  )
+
+  dca_age_tbl <- dca_age_result %>%
+    as_tibble() %>%
+    mutate(label = str_replace(label, "Treat All", "Screen All")) %>%
+    mutate(label = str_replace(label, "Treat None", "Screen None"))
+
+  write_csv(dca_age_tbl, "Results/DCA/DCA_Age_Strategies_MatchedBiomarkerCohort_Data.csv")
+
+  dca_age_tbl %>%
+    ggplot(aes(x = threshold, y = net_benefit, color = label, linetype = label)) +
+    geom_line(linewidth = 1) +
+    scale_x_continuous(limits = c(0, 0.3), labels = scales::percent) +
+    scale_y_continuous(limits = c(-0.01, NA)) +
+    scale_linetype_manual(
+      values = c(
+        "Screen All" = "solid",
+        "Screen None" = "dotted",
+        "Age > 35" = "solid",
+        "Age > 40" = "solid",
+        "Age > 45" = "solid"
+      )
+    ) +
+    scale_color_manual(
+      values = c(
+        "Screen All" = "black",
+        "Screen None" = "black",
+        "Age > 35" = "#1b9e77",
+        "Age > 40" = "#d95f02",
+        "Age > 45" = "#7570b3"
+      )
+    ) +
+    theme_minimal() +
+    labs(
+      title = "Decision Curve Analysis: Age-based Strategies for Detecting Cirrhosis",
+      subtitle = "Matched biomarker cohort",
+      x = "Threshold Probability",
+      y = "Net Benefit",
+      color = "Strategy",
+      linetype = "Strategy"
+    )
+
+  ggsave("Results/DCA/DCA_Age_Strategies_MatchedBiomarkerCohort_Cirrhosis.png", width = 8, height = 5, dpi = 300)
+
+  dca_age_tbl %>%
+    select(threshold, label, net_benefit) %>%
+    kable(digits = 3)
+} else {
+  cat("Not enough matched biomarker data for age-based decision curve analysis.\n")
+}
+```
+
+# Combined Decision Curve Analysis Comparing Age and Biomarker Strategies
+
+This figure combines the age-based and biomarker-based strategies on the same matched cohort.
+In this unadjusted version, biomarker values are assumed to already be available, so there is
+no extra penalty for obtaining the blood-based biomarker before FibroScan triage.
+
+```{r}
+df_dca_combined <- df_dca_age
+
+if (nrow(df_dca_combined) > 0) {
+  dca_combined_result <- dca(
+    formula = outcome_cirrhosis ~ strategy_age35 + strategy_age40 + strategy_age45 + strategy_apri_0_5 + strategy_apri_1_0 + strategy_apri_2_0 + strategy_fib4_1_45,
+    data = df_dca_combined,
+    thresholds = seq(0, 0.5, by = 0.01),
+    label = list(
+      strategy_age35 = "Age > 35",
+      strategy_age40 = "Age > 40",
+      strategy_age45 = "Age > 45",
+      strategy_apri_0_5 = "APRI >= 0.5",
+      strategy_apri_1_0 = "APRI >= 1.0",
+      strategy_apri_2_0 = "APRI >= 2.0",
+      strategy_fib4_1_45 = "FIB-4 >= 1.45"
+    )
+  )
+
+  dca_combined_tbl <- dca_combined_result %>%
+    as_tibble() %>%
+    mutate(label = str_replace(label, "Treat All", "Screen All")) %>%
+    mutate(label = str_replace(label, "Treat None", "Screen None"))
+
+  write_csv(dca_combined_tbl, "Results/DCA/DCA_Age_Biomarker_Strategies_Combined_Data.csv")
+
+  dca_combined_tbl %>%
+    ggplot(aes(x = threshold, y = net_benefit, color = label, linetype = label)) +
+    geom_line(linewidth = 1) +
+    scale_x_continuous(limits = c(0, 0.3), labels = scales::percent) +
+    scale_y_continuous(limits = c(-0.01, NA)) +
+    scale_linetype_manual(
+      values = c(
+        "Screen All" = "solid",
+        "Screen None" = "dotted",
+        "Age > 35" = "solid",
+        "Age > 40" = "solid",
+        "Age > 45" = "solid",
+        "APRI >= 0.5" = "solid",
+        "APRI >= 1.0" = "solid",
+        "APRI >= 2.0" = "solid",
+        "FIB-4 >= 1.45" = "solid"
+      )
+    ) +
+    scale_color_manual(
+      values = c(
+        "Screen All" = "black",
+        "Screen None" = "black",
+        "Age > 35" = "#1b9e77",
+        "Age > 40" = "#66a61e",
+        "Age > 45" = "#a6d854",
+        "APRI >= 0.5" = "#d95f02",
+        "APRI >= 1.0" = "#7570b3",
+        "APRI >= 2.0" = "#e7298a",
+        "FIB-4 >= 1.45" = "#1f78b4"
+      )
+    ) +
+    theme_minimal() +
+    labs(
+      title = "Decision Curve Analysis: Age and Biomarker Strategies for Detecting Cirrhosis",
+      subtitle = "Matched biomarker cohort",
+      x = "Threshold Probability",
+      y = "Net Benefit",
+      color = "Strategy",
+      linetype = "Strategy"
+    )
+
+  ggsave("Results/DCA/DCA_Age_Biomarker_Strategies_Combined_Cirrhosis.png", width = 9, height = 6, dpi = 300)
+
+  dca_combined_tbl %>%
+    select(threshold, label, net_benefit) %>%
+    kable(digits = 3)
+} else {
+  cat("Not enough matched biomarker data for combined decision curve analysis.\n")
+}
+```
+
+# Meta-analysis of Positive Screen Prevalence
+
+Random-effects meta-analysis is performed across contributing studies for each marker and cutoff
+using a logit-transformed proportion.
+
+```{r}
+meta_input_tbl <- positive_prev_tbl %>%
+  filter(study != "Overall")
+
+run_prevalence_meta <- function(data) {
+  esc <- metafor::escalc(
+    measure = "PLO",
+    xi = data$positive_n,
+    ni = data$denominator,
+    slab = data$study,
+    add = 0.5,
+    to = "only0"
+  )
+
+  model <- fit_re_meta(esc$yi, esc$vi)
+  stats <- extract_meta_stats(model)
+
+  tibble(
+    marker = data$marker[[1]],
+    cutoff = data$cutoff[[1]],
+    cutoff_label = data$cutoff_label[[1]],
+    studies = nrow(data),
+    total_n = sum(data$denominator),
+    total_positive = sum(data$positive_n),
+    pooled_prevalence = inv_logit(stats$pooled),
+    pooled_ci_lb = inv_logit(stats$ci_lb),
+    pooled_ci_ub = inv_logit(stats$ci_ub),
+    pooled_pi_lb = inv_logit(stats$pi_lb),
+    pooled_pi_ub = inv_logit(stats$pi_ub),
+    tau2 = stats$tau2,
+    i2 = stats$i2,
+    q = stats$q,
+    q_p = stats$q_p,
+    q_p_label = format_p(stats$q_p)
+  )
+}
+
+meta_summary_tbl <- meta_input_tbl %>%
+  group_by(marker, cutoff, cutoff_label) %>%
+  group_modify(~ run_prevalence_meta(.x)) %>%
+  ungroup() %>%
+  mutate(
+    pooled_prevalence_pct = percent(pooled_prevalence, accuracy = 0.1),
+    pooled_ci = paste0(percent(pooled_ci_lb, accuracy = 0.1), " to ", percent(pooled_ci_ub, accuracy = 0.1)),
+    pooled_pi = paste0(percent(pooled_pi_lb, accuracy = 0.1), " to ", percent(pooled_pi_ub, accuracy = 0.1)),
+    i2_pct = percent(i2 / 100, accuracy = 0.1)
+  ) %>%
+  arrange(marker, cutoff)
+
+write_csv(meta_input_tbl, "Results/Metaanalysis/APRI_FIB4_PositiveScreen_MetaInput.csv")
+write_csv(meta_summary_tbl, "Results/Metaanalysis/APRI_FIB4_PositiveScreen_MetaSummary.csv")
+
+meta_summary_tbl %>%
+  select(
+    marker,
+    cutoff_label,
+    studies,
+    total_n,
+    total_positive,
+    pooled_prevalence_pct,
+    pooled_ci,
+    pooled_pi,
+    i2_pct,
+    q_p_label
+  ) %>%
+  kable()
+```
+
+# Studies Contributing to APRI/FIB-4 Analyses
+
+```{r}
+contributing_studies_tbl <- availability_tbl %>%
+  transmute(
+    study,
+    contributes_apri = if_else(n_apri_available > 0, "Yes", "No"),
+    contributes_fib4 = if_else(n_fib4_available > 0, "Yes", "No")
+  )
+
+contributing_studies_tbl %>% kable()
+```

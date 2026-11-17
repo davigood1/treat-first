@@ -1,0 +1,493 @@
+```{r}
+library(pacman)
+dir.create("Results/Descriptives", recursive = TRUE, showWarnings = FALSE)
+p_load(tidyverse, tidylog, gtsummary, gt, officer, colorspace, tidyr, readr, scales, stringr, ggrepel)
+
+gtsummary::theme_gtsummary_compact()
+```
+
+```{r}
+# Load data
+df_all <- read_csv("Data/merged_data_all.csv", show_col_types = FALSE) 
+
+df_all <- df_all %>%
+  mutate(
+    hcv = replace_na(hcv, 0)
+  ) %>%
+  mutate(
+    # Use the inclusion/exclusion flow flags from 01_merge_data when available
+    included = if ("included_step1" %in% names(.)) coalesce(included_step1, FALSE) & !is.na(age) else (hcv == 1) & !is.na(fsm) & !is.na(age),
+    cohort = if_else(included, "Included", "Excluded")
+  ) %>%
+  mutate(
+      haz_alc = case_when(
+      audit_c_score >= 4 & str_to_lower(gender) == "male" ~ "Hazardous (AUDIT-C)",
+      audit_c_score >= 3 & str_to_lower(gender) != "male" ~ "Hazardous (AUDIT-C)",
+      is.na(audit_c_score) ~ NA_character_,
+      TRUE ~ "Not hazardous"
+    ),
+    obesity = case_when(
+      is.na(bmi) ~ NA_character_,
+      bmi >= 30 ~ "Obese (BMI ≥ 30)",
+      bmi < 30 ~ "Not obese (BMI < 30)"
+    ),
+    aboriginal = if_else(
+      aboriginal == "Indigenous", 1, 0
+      )
+  )
+
+#Change names of studies
+df_all <- df_all %>%
+  mutate(
+    study = case_when(
+      study == "Simplify" ~ "SIMPLIFY",
+      study == "Defeat" ~ "D3FEAT",
+      study == "LiverLife" ~ "LIVERLIFE",
+      study == "ETHOS" ~ "ETHOS Engage",
+      study == "DARLO" ~ "DARLO-C",
+      study == "POCT" ~ "Australian PoC Testing Program",
+      study == "TEMPO-RCT" ~ "TEMPO",
+      TRUE ~ study
+    )
+  )
+
+#Total number of cases
+df_all %>% count(study)
+
+#Create inclusion/exclusion datasets
+df_final <- df_all %>%
+  filter(included)
+
+df_excluded <- df_all %>%
+  filter(!included)
+
+#Sanity checks
+df_all %>%
+  count(cohort) %>%
+  mutate(prop = n / sum(n)) %>%
+  print()
+
+df_final %>%
+  count(cirrhosis = fsm >= 12.5) %>%
+  mutate(prop = n / sum(n)) %>%
+  print()
+
+df_final %>%
+  count(hcv)
+
+df_final %>%
+  count(fibro_valid)
+
+df_all %>%
+  group_by(study) %>%
+  count(hcv)
+
+df_all %>%
+  filter(hcv == 1) %>%
+  group_by(study) %>%
+  count(is.na(fsm))
+
+df_all %>%
+  filter(hcv == 1) %>%
+  group_by(study) %>%
+  count(fibro_valid)
+
+# Age-stratified prevalence (included cohort)
+
+# Use the *included analytic cohort* (df_final) so denominators match Table 1
+stopifnot(exists("df_final"))
+
+age_bin_prev <- df_final %>%
+  filter(!is.na(age), !is.na(fsm)) %>%
+  mutate(
+    age_bin = cut(
+      age,
+      breaks = c(-Inf, 35, 40, 45, Inf),
+      right = FALSE,
+      labels = c("<35", "35-39", "40-44", "45+")
+    ),
+    fsm_12_5 = fsm >= 12.5,
+    fsm_20 = fsm > 20
+  ) %>%
+  group_by(age_bin) %>%
+  summarise(
+    n_cohort = n(),
+    n_fsm_12_5 = sum(fsm_12_5),
+    prev_fsm_12_5 = mean(fsm_12_5),
+    n_fsm_20 = sum(fsm_20),
+    prev_fsm_20 = mean(fsm_20),
+    .groups = "drop"
+  )
+
+age_bin_prev
+
+write_csv(age_bin_prev, "Results/Descriptives/Cohort_Prevalence_byAgeBin_included.csv")
+
+cat(
+  "Included cohort with non-missing age+FSM:",
+  sum(age_bin_prev$n_cohort),
+  "\n"
+)
+```
+
+# Summary study level
+
+```{r}
+df_study <- read_csv("Data/study_data.csv")
+
+# unweighted table = number of studies
+tbl_studies <- df_study %>%
+  select(
+    `Study location` = study_location,
+    `Study design` = study_design,
+    `Included sample size` = sample_group,
+    `Population included` = population_group
+  ) %>%
+  tbl_summary(
+    missing = "no",
+    statistic = all_categorical() ~ "{n} ({p}%)",
+    digits = all_categorical() ~ c(0, 0),
+    sort = list(
+      `Study location` ~ "frequency",
+      `Study design` ~ "frequency",
+      `Included sample size` ~ "frequency",
+      `Population included` ~ "frequency"
+    )
+  )
+
+tbl_studies
+
+```
+
+# Summary Patient level
+
+```{r}
+# Print Summary by study
+tbl.1 <- df_final %>% 
+  select(-id) %>% 
+  select(
+    Study = study,
+    Age = age,
+    Gender = gender,
+    #Ethnicity = ethnicity,
+    `Identified as Aboriginal and/or Torres Strait Islander` = aboriginal,
+    #Height = height,
+    #Weight = weight,
+    `BMI, median (IQR)` = bmi,
+    `Obesity (BMI ≥ 30)` = obesity,
+    #`Alcohol frequency` = alcohol_frequency_cat,
+    #`Alcohol amount` = alcohol_amount_cat,
+    #`Alcohol binge frequency` = alcohol_binge_cat,
+    `AUDIT-C score` = audit_c_score,
+    `Hazardous alcohol use` = haz_alc,
+    HIV = hiv,
+    HBV = hbv,
+    `Median liver stiffness (kPa)` = fsm,
+    `Liver stiffness measurement (Metavir category)` = metavir,
+    `CSPH (>20 kPa)` = fsm_20
+    #`FIB-4 score` = fib4,
+    #`FIB-4 category` = fib4_cat,
+    #`APRI score` = apri,
+    #`APRI category` = apri_cat,
+    #ALT = alt,
+    #AST = ast,
+    #Platelets = platelets,
+    #Albumin = albumin,
+    #Creatinine = creatinine
+  ) %>%
+  tbl_summary(
+    by = Study,
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = list(
+      all_continuous() ~ 0,
+      all_categorical() ~ c(0, 0)
+    ),
+    sort = list(
+      `Gender` ~ "frequency",
+      `Liver stiffness measurement (Metavir category)` ~ "frequency"),
+    missing = "ifany",
+    missing_text = "Missing",
+    missing_stat = "{N_miss} ({p_miss}%)"
+  ) %>%
+  modify_table_body(
+    ~ .x %>%
+      mutate(across(starts_with("stat_"), ~ str_replace_all(., "NA \\(NA, NA\\)", "NA") %>% str_replace_all("0 \\(NA%\\)", "NA")))
+  )   %>%
+  modify_footnote(
+    everything() ~
+  "Abbreviations: AUDIT-C = Alcohol Use Disorders Identification Test-Consumption; BMI = body mass index; CSPH = clinically significant portal hypertension; HBV = hepatitis B virus; HCV = hepatitis C virus; HIV = human immunodeficiency virus; kPa = kilopascals; NA = not available. Data are presented as median (Q1, Q3) or n (%).")
+
+
+tbl.1
+
+#Overall
+
+tbl.2 <- df_final %>%
+  select(-id) %>%
+  select(
+    Age = age,
+    Gender = gender,
+    #Ethnicity = ethnicity,
+    `Identified as Aboriginal and/or Torres Strait Islander` = aboriginal,
+    #Height = height,
+    #Weight = weight,
+    `BMI, median (IQR)` = bmi,
+    `Obesity (BMI ≥ 30)` = obesity,
+    #`Alcohol frequency` = alcohol_frequency_cat,
+    #`Alcohol amount` = alcohol_amount_cat,
+    #`Alcohol binge frequency` = alcohol_binge_cat,
+    `AUDIT-C score` = audit_c_score,
+    `Hazardous alcohol use` = haz_alc,
+    HIV = hiv,
+    HBV = hbv,
+    `Median liver stiffness (kPa)` = fsm,
+    `Liver stiffness measurement (Metavir category)` = metavir,
+    `CSPH (>20 kPa)` = fsm_20
+    #`FIB-4 score` = fib4,
+    #`FIB-4 category` = fib4_cat,
+    #`APRI score` = apri,
+    #`APRI category` = apri_cat,
+    #ALT = alt,
+    #AST = ast,
+    #Platelets = platelets,
+    #Albumin = albumin,
+    #Creatinine = creatinine
+  ) %>%
+  tbl_summary(
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = list(
+      all_continuous() ~ 0,
+      all_categorical() ~ c(0, 0)
+    ),
+    sort = list(
+      `Gender` ~ "frequency",
+      `Liver stiffness measurement (Metavir category)` ~ "frequency"),
+    missing = "ifany",
+    missing_text = "Missing",
+    missing_stat = "{N_miss} ({p_miss}%)"
+  ) %>%
+  modify_table_body(
+    ~ .x %>%
+      mutate(across(starts_with("stat_"), ~ str_replace_all(., "NA \\(NA, NA\\)", "NA") %>% str_replace_all("0 \\(NA%\\)", "NA")))
+  )
+
+tbl.2
+
+#Merge study level and IPD tables
+tbl.2.stack <- tbl_stack(list(tbl_studies, tbl.2), group_header = c("Study-level", "Individual participant data-level")) %>%
+  modify_footnote(
+    everything() ~
+  "Abbreviations: AUDIT-C = Alcohol Use Disorders Identification Test-Consumption; BMI = body mass index; CSPH = clinically significant portal hypertension; HBV = hepatitis B virus; HCV = hepatitis C virus; HIV = human immunodeficiency virus; kPa = kilopascals; NA = not available. Data are presented as median (Q1, Q3) or n (%).")
+
+tbl.2.stack 
+
+#Save to word
+p_load(gtregression)
+save_docx(tables = lapply(list(tbl.2.stack, tbl.1), gtsummary::as_flex_table), filename = "Results/Descriptives/Table_1_overall_integer.docx")
+
+```
+
+```{r}
+tbl.cirrhosis <- df_final %>%
+  select(-id) %>%
+  mutate(
+    Cirrhosis = case_when(
+      fsm >= 12.5 ~ "Cirrhosis (LSM >= 12.5 kPa)",
+      fsm < 12.5 ~ "No cirrhosis (LSM < 12.5 kPa)",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(
+    #Study = study,
+    `Age, median (IQR)` = age,
+    Gender = gender,
+    #Ethnicity = ethnicity,
+    Aboriginal = aboriginal,
+    #Height = height,
+    #Weight = weight,
+    `BMI, median (IQR)` = bmi,
+    `Obesity (BMI ≥ 30)` = obesity,
+    #`Alcohol frequency` = alcohol_frequency_cat,
+    #`Alcohol amount` = alcohol_amount_cat,
+    #`Alcohol binge frequency` = alcohol_binge_cat,
+    `AUDIT-C score` = audit_c_score,
+    `Hazardous alcohol use` = haz_alc,
+    HIV = hiv,
+    HBV = hbv,
+    Cirrhosis
+    #`FIB-4 score` = fib4,
+    #`FIB-4 category` = fib4_cat,
+    #`APRI score` = apri,
+    #`APRI category` = apri_cat,
+    #ALT = alt,
+    #AST = ast,
+    #Platelets = platelets,
+    #Albumin = albumin,
+    #Creatinine = creatinine
+  ) %>%
+  tbl_summary(
+    by = "Cirrhosis",
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = list(
+      all_continuous() ~ 0,
+      all_categorical() ~ c(0, 0)
+    ),
+    sort = list(
+      `Gender` ~ "frequency"),
+    missing = "ifany",
+    missing_text = "Missing",
+    missing_stat = "{N_miss} ({p_miss}%)"
+  ) %>%
+  modify_table_body(
+    ~ .x %>%
+      mutate(across(starts_with("stat_"), ~ str_replace_all(., "NA \\(NA, NA\\)", "NA") %>% str_replace_all("0 \\(NA%\\)", "NA")))
+  ) %>%
+  add_p()
+
+tbl.cirrhosis
+
+tbl.csph <- df_final %>%
+  mutate(
+    CSPH = case_when(
+      fsm > 20 ~ "CSPH (LSM > 20 kPa)",
+      fsm <= 20 ~ "No CSPH (LSM ≤ 20 kPa)",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(-id) %>%
+  select(
+    #Study = study,
+    `Age, median (IQR)` = age,
+    Gender = gender,
+    #Ethnicity = ethnicity,
+    Aboriginal = aboriginal,
+    #Height = height,
+    #Weight = weight,
+    `BMI, median (IQR)` = bmi,
+    `Obesity (BMI ≥ 30)` = obesity,
+    #`Alcohol frequency` = alcohol_frequency_cat,
+    #`Alcohol amount` = alcohol_amount_cat,
+    #`Alcohol binge frequency` = alcohol_binge_cat,
+    `AUDIT-C score` = audit_c_score,
+    `Hazardous alcohol use` = haz_alc,
+    HIV = hiv,
+    HBV = hbv,
+    CSPH
+    #`FIB-4 score` = fib4,
+    #`FIB-4 category` = fib4_cat,
+    #`APRI score` = apri,
+    #`APRI category` = apri_cat,
+    #ALT = alt,
+    #AST = ast,
+    #Platelets = platelets,
+    #Albumin = albumin,
+    #Creatinine = creatinine
+  ) %>%
+  tbl_summary(
+    by = "CSPH",
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = list(
+      all_continuous() ~ 0,
+      all_categorical() ~ c(0, 0)
+    ),
+    sort = list(
+      `Gender` ~ "frequency"),
+    missing = "ifany",
+    missing_text = "Missing",
+    missing_stat = "{N_miss} ({p_miss}%)"
+  ) %>%
+  modify_table_body(
+    ~ .x %>%
+      mutate(across(starts_with("stat_"), ~ str_replace_all(., "NA \\(NA, NA\\)", "NA") %>% str_replace_all("0 \\(NA%\\)", "NA")))
+  ) %>%
+  add_p()
+
+tbl.csph
+
+tbl.outcomes <- tbl_merge(
+  list(tbl.cirrhosis, tbl.csph),
+  tab_spanner = c("**Cirrhosis**", "**Clinically significant\nportal hypertension**")) %>%
+  modify_footnote(
+    everything() ~ "Abbreviations: AUDIT-C = Alcohol Use Disorders Identification Test-Consumption; BMI = body mass index; CSPH = clinically significant portal hypertension; HBV = hepatitis B virus; HCV = hepatitis C virus; HIV = human immunodeficiency virus; kPa = kilopascals; LSM = liver stiffness measurement; NA = not available. Data are presented as median (Q1, Q3) or n (%)."
+  )
+
+tbl.outcomes 
+
+save_docx(tables = list(gtsummary::as_flex_table(tbl.outcomes)), filename = "Results/Descriptives/Table_2_cirrhosis_and_csph2_integer.docx")
+
+```
+
+# Included vs excluded
+
+```{r}
+tbl.included_vs_excluded <- df_all %>%
+  filter(hcv == 1) %>%
+  mutate(invalid_fibroscan = if_else(fibro_valid == 0, 1, 0)) %>%
+  mutate(
+    Cohort = factor(cohort, levels = c("Included", "Excluded"))
+  ) %>%
+  select(
+    Cohort,
+    Study = study,
+    `Invalid Fibroscan` = invalid_fibroscan,
+    `Age, median (IQR)` = age,
+    Gender = gender,
+    #Ethnicity = ethnicity,
+    Aboriginal = aboriginal,
+    BMI = bmi,
+    `Obesity (BMI ≥ 30)` = obesity,
+    `AUDIT-C score` = audit_c_score,
+    `Hazardous alcohol use` = haz_alc,
+    HIV = hiv,
+    HBV = hbv,
+    `Median liver stiffness (kPa)` = fsm,
+    `Liver stiffness measurement (Metavir category)` = metavir,
+    `CSPH (>20 kPa)` = fsm_20
+  ) %>%
+  tbl_summary(
+    by = Cohort,
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = list(
+      all_continuous() ~ 0,
+      all_categorical() ~ c(0, 0),
+      `Median liver stiffness (kPa)` ~ 1
+    ),
+   sort = list(
+      `Gender` ~ "frequency",
+      `Liver stiffness measurement (Metavir category)` ~ "frequency"),
+    missing = "ifany",
+    missing_text = "Missing",
+    missing_stat = "{N_miss} ({p_miss}%)"
+  ) %>%
+  modify_table_body(
+    ~ .x %>%
+      mutate(across(starts_with("stat_"), ~ str_replace_all(., "NA \\(NA, NA\\)", "NA") %>% str_replace_all("0 \\(NA%\\)", "NA"))) %>%
+      mutate(label = if_else(label == "Unknown", "Missing", label))
+  ) %>%
+  add_p() %>%
+  modify_footnote(
+    everything() ~ "Abbreviations: AUDIT-C = Alcohol Use Disorders Identification Test-Consumption; BMI = body mass index; CSPH = clinically significant portal hypertension; HBV = hepatitis B virus; HCV = hepatitis C virus; HIV = human immunodeficiency virus; kPa = kilopascals; NA = not available. Data are presented as median (Q1, Q3) or n (%)."
+  )
+
+tbl.included_vs_excluded 
+
+save_docx(
+  tables = list(gtsummary::as_flex_table(tbl.included_vs_excluded)),
+  filename = "Results/Descriptives/Table_included_vs_excluded_integer.docx"
+)
+```

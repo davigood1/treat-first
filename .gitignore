@@ -1,0 +1,29 @@
+# Private and derived participant-level data must never be committed.
+Data/
+Data
+data/
+data
+Results/
+*.csv
+*.tsv
+*.dta
+*.sav
+*.rds
+*.RData
+*.rda
+*.parquet
+*.feather
+*.xlsx
+*.xls
+
+# Local R and editor state.
+.Rhistory
+.Rproj.user/
+.DS_Store
+.venv/
+renv/library/
+*_cache/
+*_files/
+*.html
+Rplots.pdf
+

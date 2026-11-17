@@ -1,0 +1,309 @@
+---
+title: "PRISMA Flow Diagram"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+pacman::p_load(tidyverse, DiagrammeR, DiagrammeRsvg, rsvg, glue, magick)
+
+```
+
+## IPD PRISMA Flow Diagram
+
+```{r}
+library(readr)
+library(glue)
+library(DiagrammeR)
+library(DiagrammeRsvg)
+library(rsvg)
+library(magick)
+library(ggplot2)
+library(grid)
+
+# 1. Load Data
+if (!file.exists("Results/Descriptives/Study_Flow_Counts.csv")) {
+  stop("Results/Study_Flow_Counts.csv not found. Please run 01_merge_data.Rmd first.")
+}
+
+counts <- read_csv("Results/Descriptives/Study_Flow_Counts.csv", show_col_types = FALSE)
+
+# 2. Calculate aggregates for included IPD studies
+n_studies_init <- nrow(counts)
+n_total_init   <- sum(counts$Total, na.rm = TRUE)
+
+n_excl_hcv <- sum(counts$Excluded_HCV, na.rm = TRUE)
+n_kept_hcv <- sum(counts$Kept_HCV, na.rm = TRUE)
+
+n_excl_fsm <- sum(counts$Excluded_MissingFSM, na.rm = TRUE)
+n_kept_fsm <- sum(counts$Kept_HasFSM, na.rm = TRUE)
+
+n_excl_val <- sum(counts$Excluded_InvalidFSM, na.rm = TRUE)
+n_excl_age <- if ("Excluded_MissingAge" %in% names(counts)) {
+  sum(counts$Excluded_MissingAge, na.rm = TRUE)
+} else {
+  0
+}
+n_final    <- sum(counts$Final_Analysis, na.rm = TRUE)
+
+# Use this if some studies ended up with zero included participants
+k_final <- counts %>%
+  dplyr::filter(Final_Analysis > 0) %>%
+  nrow()
+
+# 3. Study-level exclusions before IPD acquisition
+k_excl_acute_trials        <- 5
+k_excl_chronic_no_cirr_rct <- 2
+k_excl_no_te_cohort        <- 1
+k_excl_no_cirr_cohort      <- 2
+
+k_excluded_studies <- k_excl_acute_trials +
+  k_excl_chronic_no_cirr_rct +
+  k_excl_no_te_cohort +
+  k_excl_no_cirr_cohort
+
+k_total_evaluated <- n_studies_init + k_excluded_studies
+
+# 4. Define diagram
+diagram_code <- glue("
+digraph prisma {{
+
+  graph [layout = dot, rankdir = TB, nodesep = 0.6, ranksep = 0.7]
+  
+  node [shape = box,
+        style = 'filled,rounded',
+        fillcolor = white,
+        fontname = 'Helvetica',
+        fontsize = 10,
+        width = 3.6]
+        
+  edge [fontname = 'Helvetica', fontsize = 9]
+
+  # --- Nodes ---
+
+  node0 [label = 'Studies evaluated for eligibility\\nk = {k_total_evaluated} studies']
+
+  excl0 [label = 'Excluded studies\\n\\nClinical trials among people with acute/recent HCV infection, k = {k_excl_acute_trials}\\nClinical trials among people with chronic HCV infection that excluded people with cirrhosis, k = {k_excl_chronic_no_cirr_rct}\\nCohort studies among people with HCV infection that did not include transient elastography, k = {k_excl_no_te_cohort}\\nCohort studies among people with HCV infection that excluded those with cirrhosis, k = {k_excl_no_cirr_cohort}',
+         fillcolor = '#ffeeee',
+         width = 5.5]
+
+  node1 [label = 'IPD obtained\\nk = {n_studies_init} studies\\nn = {n_total_init} participants']
+
+  node2 [label = 'HCV detected / included\\nn = {n_kept_hcv}']
+  excl2 [label = 'Excluded: HCV not detected / missing\\nn = {n_excl_hcv}',
+         fillcolor = '#ffeeee']
+
+  node3 [label = 'Transient elastography available\\nn = {n_kept_fsm}']
+  excl3 [label = 'Excluded: Missing transient elastography\\nn = {n_excl_fsm}',
+         fillcolor = '#ffeeee']
+
+    node4 [label = 'Valid transient elastography\nn = {n_kept_fsm - n_excl_val}']
+
+    node5 [label = 'Included in analysis\nk = {k_final} studies\nn = {n_final} participants',
+      fillcolor = '#ccffcc',
+      penwidth = 2]
+
+    excl4 [label = 'Excluded: Invalid transient elastography\n(IQR/median > 30%)\nn = {n_excl_val}',
+      fillcolor = '#ffeeee']
+
+    excl5 [label = 'Excluded: Missing age\nn = {n_excl_age}',
+      fillcolor = '#ffeeee']
+
+  # --- Main flow ---
+  node0 -> node1
+  node1 -> node2
+  node2 -> node3
+  node3 -> node4
+  node4 -> node5
+
+  # --- Exclusion branches ---
+  node0 -> excl0 [minlen = 2]
+  node1 -> excl2 [minlen = 2]
+  node2 -> excl3 [minlen = 2]
+  node3 -> excl4 [minlen = 2]
+  node4 -> excl5 [minlen = 2]
+
+  # --- Alignment ---
+  {{ rank = same; node0; excl0 }}
+  {{ rank = same; node1; excl2 }}
+  {{ rank = same; node2; excl3 }}
+  {{ rank = same; node3; excl4 }}
+  {{ rank = same; node4; excl5 }}
+}}
+")
+
+# 5. Render
+viz <- grViz(diagram_code)
+
+viz
+
+# Dedicated export folder (requested)
+out_dir <- file.path("Results", "PRISMA_flow")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+svg_text <- export_svg(viz)
+svg_path <- file.path(out_dir, "PRISMA_flow.svg")
+writeLines(svg_text, svg_path)
+
+# PNG @ 300 DPI (no title)
+magick::image_read(svg_path, density = 300) %>%
+  magick::image_write(
+    path = file.path(out_dir, "PRISMA_flow.png"),
+    format = "png",
+    density = "300x300"
+  )
+
+# PDF export (vector)
+charToRaw(svg_text) %>%
+  rsvg_pdf(file.path(out_dir, "PRISMA_flow.pdf"))
+
+# Submission EPS: use the generic exclusion categories and counts above.
+dir.create("outputs/figures", recursive = TRUE, showWarnings = FALSE)
+rsvg::rsvg_eps(charToRaw(svg_text), "outputs/figures/Figure_1_600dpi.eps")
+
+# Backwards-compatible copies in Results/Descriptives
+dir.create("Results/Descriptives", recursive = TRUE, showWarnings = FALSE)
+file.copy(file.path(out_dir, "PRISMA_flow.png"), "Results/Descriptives/PRISMA_flow.png", overwrite = TRUE)
+file.copy(file.path(out_dir, "PRISMA_flow.pdf"), "Results/Descriptives/PRISMA_flow.pdf", overwrite = TRUE)
+```
+
+```{r}
+
+# 5b. Optional ggplot version (custom IPD flow)
+make_prisma_ggplot <- function(
+  k_total_evaluated,
+  n_studies_init,
+  n_total_init,
+  n_excl_hcv,
+  n_kept_hcv,
+  n_excl_fsm,
+  n_kept_fsm,
+  n_excl_val,
+  n_excl_age,
+  k_final,
+  n_final
+) {
+  box_w <- 3.8
+  box_h <- 0.85
+  x_main <- 0
+  x_excl <- 5.3
+
+  nodes <- tibble::tibble(
+    key = c("node0", "node1", "node2", "node3", "node4", "node5", "excl0", "excl2", "excl3", "excl4", "excl5"),
+    x = c(x_main, x_main, x_main, x_main, x_main, x_main, x_excl, x_excl, x_excl, x_excl, x_excl),
+    y = c(5, 4, 3, 2, 1, 0, 5, 4, 3, 2, 1),
+    label = c(
+      glue::glue("Studies evaluated for eligibility\n(k = {k_total_evaluated} studies)"),
+      glue::glue("IPD obtained\n(k = {n_studies_init} studies; n = {n_total_init} participants)"),
+      glue::glue("HCV detected / included\n(n = {n_kept_hcv})"),
+      glue::glue("Transient elastography available\n(n = {n_kept_fsm})"),
+      glue::glue("Valid transient elastography\n(n = {n_kept_fsm - n_excl_val})"),
+      glue::glue("Included in analysis\n(k = {k_final} studies;\nn = {n_final} participants)"),
+      glue::glue(
+        "Excluded studies\n\n",
+        "Clinical trials among people with acute/recent HCV infection, k = {k_excl_acute_trials}\n",
+        "Clinical trials among people with chronic HCV infection that excluded people with cirrhosis, k = {k_excl_chronic_no_cirr_rct}\n",
+        "Cohort studies among people with HCV infection that did not include transient elastography, k = {k_excl_no_te_cohort}\n",
+        "Cohort studies among people with HCV infection that excluded those with cirrhosis, k = {k_excl_no_cirr_cohort}\n",
+      ),
+      glue::glue("Excluded: HCV not detected / missing\n(n = {n_excl_hcv})"),
+      glue::glue("Excluded: Missing transient elastography\n(n = {n_excl_fsm})"),
+      glue::glue("Excluded: Invalid transient elastography\n(IQR/median > 30%)\n(n = {n_excl_val})"),
+      glue::glue("Excluded: Missing age\n(n = {n_excl_age})")
+    ),
+    fill = rep("white", 11)
+  )
+
+  main_edges <- tibble::tibble(
+    x = x_main,
+    xend = x_main,
+    y = c(5, 4, 3, 2, 1),
+    yend = c(4, 3, 2, 1, 0),
+    linetype = "solid"
+  )
+
+  excl_edges <- tibble::tibble(
+    x = x_main + box_w / 2,
+    xend = x_excl - box_w / 2,
+    y = c(5, 4, 3, 2, 1),
+    yend = c(5, 4, 3, 2, 1),
+    linetype = "dashed"
+  )
+
+  ggplot() +
+    geom_rect(
+      data = nodes,
+      aes(
+        xmin = x - box_w / 2,
+        xmax = x + box_w / 2,
+        ymin = y - box_h / 2,
+        ymax = y + box_h / 2,
+        fill = fill
+      ),
+      colour = "black",
+      linewidth = 0.25
+    ) +
+    geom_text(
+      data = nodes,
+      aes(x = x, y = y, label = label),
+      size = 2.6,
+      lineheight = 0.98
+    ) +
+    geom_segment(
+      data = main_edges,
+      aes(x = x, y = y - box_h / 2, xend = xend, yend = yend + box_h / 2),
+      linewidth = 0.25,
+      arrow = grid::arrow(length = grid::unit(0.14, "cm"), type = "closed")
+    ) +
+    geom_segment(
+      data = excl_edges,
+      aes(x = x, y = y, xend = xend, yend = yend, linetype = linetype),
+      linewidth = 0.22,
+      arrow = grid::arrow(length = grid::unit(0.14, "cm"), type = "closed")
+    ) +
+    scale_fill_identity() +
+    scale_linetype_identity() +
+    coord_cartesian(xlim = c(-3.2, 9.0), ylim = c(-0.8, 5.8), clip = "off") +
+    theme_void(base_family = "Helvetica")
+}
+
+# 6. Export
+
+
+
+# ggplot exports (PNG + PDF)
+gg_viz <- make_prisma_ggplot(
+  k_total_evaluated = k_total_evaluated,
+  n_studies_init = n_studies_init,
+  n_total_init = n_total_init,
+  n_excl_hcv = n_excl_hcv,
+  n_kept_hcv = n_kept_hcv,
+  n_excl_fsm = n_excl_fsm,
+  n_kept_fsm = n_kept_fsm,
+  n_excl_val = n_excl_val,
+  n_excl_age = n_excl_age,
+  k_final = k_final,
+  n_final = n_final
+)
+
+ggplot2::ggsave(
+  filename = file.path(out_dir, "PRISMA_flow_ggplot.png"),
+  plot = gg_viz,
+  width = 180,
+  height = 200,
+  units = "mm",
+  dpi = 300,
+  bg = "white"
+)
+
+ggplot2::ggsave(
+  filename = file.path(out_dir, "PRISMA_flow_ggplot.pdf"),
+  plot = gg_viz,
+  width = 180,
+  height = 200,
+  units = "mm"
+)
+
+# 7. Display in RStudio / HTML
+viz
+```

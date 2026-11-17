@@ -1,0 +1,345 @@
+---
+title: "Decision Curve Analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(pacman)
+dir.create("Results/DCA", recursive = TRUE, showWarnings = FALSE)
+p_load(tidyverse, dcurves, gtsummary)
+```
+
+# Load Data
+
+```{r}
+df <- read_csv("Data/merged_data.csv", show_col_types = FALSE)
+
+# Filter for analysis population (must have FibroScan result to determine outcome)
+df_analysis <- df %>%
+  filter(!is.na(fsm)) %>%
+  filter(!is.na(age))
+
+print(paste("Analysis N:", nrow(df_analysis)))
+```
+
+# Define Outcome and Strategies
+
+Here we define the outcome as **Cirrhosis** (FibroScan $\ge$ 12.5 kPa).
+We compare three Age-based strategies:
+1.  Treat/Screen if Age > 35
+2.  Treat/Screen if Age > 40
+3.  Treat/Screen if Age > 45
+
+```{r}
+df_dca <- df_analysis %>%
+  mutate(
+    # Outcome: Cirrhosis (1 = Yes, 0 = No)
+    outcome_cirrhosis = if_else(fsm >= 12.5, 1, 0),
+    
+    # Stratgies (Binary)
+    strategy_age35 = if_else(age > 35, 1, 0),
+    strategy_age40 = if_else(age > 40, 1, 0),
+    strategy_age45 = if_else(age > 45, 1, 0)
+  )
+
+# Check event rates
+df_dca %>%
+  count(outcome_cirrhosis) %>%
+  mutate(prop = n / sum(n))
+```
+
+# Run Decision Curve Analysis
+
+```{r}
+# Run DCA
+dca_result <- dca(
+  formula = outcome_cirrhosis ~ strategy_age35 + strategy_age40 + strategy_age45,
+  data = df_dca,
+  thresholds = seq(0, 0.5, by = 0.01),
+  label = list(
+    strategy_age35 = "Age > 35",
+    strategy_age40 = "Age > 40",
+    strategy_age45 = "Age > 45"
+  )
+)
+
+dca(
+  formula = outcome_cirrhosis ~ strategy_age35 + strategy_age40 + strategy_age45,
+  data = df_dca,
+  thresholds = seq(0, 0.5, by = 0.01),
+  label = list(
+    strategy_age35 = "Age > 35",
+    strategy_age40 = "Age > 40",
+    strategy_age45 = "Age > 45"
+  )
+) %>%
+  standardized_net_benefit()
+
+# Plot
+dca_result %>%
+  as_tibble() %>%
+  mutate(label = str_replace(label, "Treat All", "Screen All")) %>%
+  mutate(label = str_replace(label, "Treat None", "Screen None")) %>%
+  ggplot(aes(x = threshold, y = net_benefit, color = label, linetype = label)) +
+  geom_line(linewidth = 1) +
+  scale_x_continuous(limits = c(0, 0.3), labels = scales::percent) +
+  scale_y_continuous(limits = c(-0.01, NA)) + # Zoom in on relevant positive range
+  scale_linetype_manual(
+    values = c(
+      "Screen All" = "solid",
+      "Screen None" = "dotted",
+      "Age > 35" = "solid",
+      "Age > 40" = "solid",
+      "Age > 45" = "solid"
+    )
+  ) +
+  scale_color_manual(
+    values = c(
+      "Screen All" = "black",
+      "Screen None" = "black",
+      "Age > 35" = "#1b9e77",
+      "Age > 40" = "#d95f02",
+      "Age > 45" = "#7570b3"
+    )
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Decision Curve Analysis: Age-based Strategies for Detecting Cirrhosis",
+    x = "Threshold Probability",
+    y = "Net Benefit",
+    color = "Strategy",
+    linetype = "Strategy"
+  )
+
+ggsave("Results/DCA/DCA_Age_Strategies_Cirrhosis.png", width = 8, height = 5, dpi = 300)
+```
+
+
+# Inclusion of Non-Invasive Markers (Optional Comparison)
+
+Comparing Age strategies against APRI (>1.0) and FIB-4 (>3.25) if available.
+
+```{r}
+# Filter for rows that also have APRI/FIB4 available for fair comparison
+df_dca_bio <- df_dca %>%
+  filter(!is.na(apri), !is.na(fib4))
+
+if(nrow(df_dca_bio) > 0) {
+  
+  df_dca_bio <- df_dca_bio %>%
+    mutate(
+      strategy_apri1 = if_else(apri > 1.0, 1, 0),
+      strategy_fib4_3.25 = if_else(fib4 > 3.25, 1, 0)
+    )
+
+  dca_bio_ref <- dca(
+    formula = outcome_cirrhosis ~ strategy_age35 + strategy_age40 + strategy_age45 + strategy_apri1 + strategy_fib4_3.25,
+    data = df_dca_bio,
+    thresholds = seq(0, 0.5, by = 0.01),
+     label = list(
+      strategy_age35 = "Age > 35",
+      strategy_age40 = "Age > 40",
+      strategy_age45 = "Age > 45",
+      strategy_apri1 = "APRI > 1.0",
+      strategy_fib4_3.25 = "FIB-4 > 3.25"
+    )
+  )
+  
+  dca_bio_ref %>%
+    as_tibble() %>%
+    mutate(label = str_replace(label, "Treat All", "Screen All")) %>%
+    mutate(label = str_replace(label, "Treat None", "Screen None")) %>%
+    ggplot(aes(x = threshold, y = net_benefit, color = label, linetype = label)) +
+    geom_line(linewidth = 1) +
+    scale_x_continuous(limits = c(0, 0.3), labels = scales::percent) +
+    scale_y_continuous(limits = c(-0.01, NA)) +
+    scale_linetype_manual(
+      values = c(
+        "Screen All" = "solid",
+        "Screen None" = "dotted",
+        "Age > 35" = "solid",
+        "Age > 40" = "solid",
+        "Age > 45" = "solid",
+        "APRI > 1.0" = "solid",
+        "FIB-4 > 3.25" = "solid"
+      )
+    ) +
+    scale_color_manual(
+      values = c(
+        "Screen All" = "black",
+        "Screen None" = "black",
+        "Age > 35" = "#1b9e77",
+        "Age > 40" = "#d95f02",
+        "Age > 45" = "#7570b3",
+         "APRI > 1.0" = "blue",
+        "FIB-4 > 3.25" = "red"
+      )
+    ) +
+    theme_minimal() +
+    labs(
+      title = "Decision Curve Analysis: Age vs Biomarkers",
+      x = "Threshold Probability",
+      y = "Net Benefit",
+      color = "Strategy",
+      linetype = "Strategy"
+    )
+    
+  ggsave("Results/DCA/BayesDCA_Age_Biomarkers.png", width = 8, height = 5, dpi = 300)
+} else {
+  print("Not enough data with matched APRI/FIB4 for comparison.")
+}
+```
+
+# Clinical Impact and Interventions Avoided
+
+## Clinical Impact Plot
+
+# Using `rmda` package to generate Clinical Impact Plots with confidence intervals.
+# (Commented out temporarily to avoid execution errors if pkg missing/failed)
+
+# ```{r}
+# # Create decision curve objects using rmda
+# # We fit a decision curve for each strategy to visualize their clinical impact separately
+# # Note: rmda calculates CIs via bootstrapping
+# 
+# dc_age35 <- decision_curve(outcome_cirrhosis ~ strategy_age35, 
+#                            data = df_dca, 
+#                            thresholds = seq(0, 0.4, by = 0.01), 
+#                            study.design = "cohort", 
+#                            bootstraps = 100) # Reduce bootstraps for speed if needed
+# 
+# dc_age40 <- decision_curve(outcome_cirrhosis ~ strategy_age40, 
+#                            data = df_dca, 
+#                            thresholds = seq(0, 0.4, by = 0.01), 
+#                            study.design = "cohort", 
+#                            bootstraps = 100)
+# 
+# dc_age45 <- decision_curve(outcome_cirrhosis ~ strategy_age45, 
+#                            data = df_dca, 
+#                            thresholds = seq(0, 0.4, by = 0.01), 
+#                            study.design = "cohort", 
+#                            bootstraps = 100)
+# 
+# # Plot Clinical Impact for each strategy
+# # Standardizing to 1000 patients
+# par(mfrow = c(1, 3)) # Display outcome in a row if rendering allows, otherwise run sequentially
+# 
+# plot_clinical_impact(dc_age35, population.size = 100, confidence.intervals = F, cost.benefit.axis = FALSE, main = "Age > 35")
+# plot_clinical_impact(dc_age40, population.size = 100, confidence.intervals = F, cost.benefit.axis = FALSE, main = "Age > 40")
+# plot_clinical_impact(dc_age45, population.size = 100, confidence.intervals = F, cost.benefit.axis = FALSE, main = "Age > 45")
+# ?plot_clinical_impact
+# par(mfrow = c(1, 1)) # Reset par
+# ```
+
+## Interventions Avoided Plot
+
+```{r}
+dca(
+  formula = outcome_cirrhosis ~ strategy_age35 + strategy_age40 + strategy_age45,
+  data = df_dca,
+  thresholds = seq(0, 0.5, by = 0.01),
+  label = list(
+    strategy_age35 = "Age > 35",
+    strategy_age40 = "Age > 40",
+    strategy_age45 = "Age > 45"
+  ),
+  as_probability = c("strategy_age35", "strategy_age40", "strategy_age45")
+  ) %>%
+  net_intervention_avoided() %>%
+  plot(smooth = T) +
+  scale_x_continuous(limits = c(0, 0.3), labels = scales::percent)
+
+ggsave("Results/DCA/Net_Interventions_Avoided_Prob.png", width = 8, height = 5, dpi = 300)
+
+dca(
+  formula = outcome_cirrhosis ~ strategy_age35 + strategy_age40 + strategy_age45,
+  data = df_dca,
+  thresholds = seq(0, 0.5, by = 0.01),
+  label = list(
+    strategy_age35 = "Age > 35",
+    strategy_age40 = "Age > 40",
+    strategy_age45 = "Age > 45"
+  )
+  ) %>%
+  net_intervention_avoided() %>%
+  plot(smooth = T) +
+  scale_x_continuous(limits = c(0, 0.3), labels = scales::percent)
+
+ggsave("Results/DCA/Net_Interventions_Avoided.png", width = 8, height = 5, dpi = 300)
+
+
+```
+
+# Sub-analysis: Clinically Significant Portal Hypertension (CSPH)
+
+Here we define the outcome as **CSPH** (FibroScan $\ge$ 20 kPa).
+
+```{r}
+# Re-create dataset with CSPH outcome
+df_dca_csph <- df_analysis %>%
+  mutate(
+    # Outcome: CSPH (1 = Yes, 0 = No)
+    outcome_csph = if_else(fsm > 20, 1, 0),
+    
+    # Stratgies (Binary)
+    strategy_age35 = if_else(age > 35, 1, 0),
+    strategy_age40 = if_else(age > 40, 1, 0),
+    strategy_age45 = if_else(age > 45, 1, 0)
+  )
+
+# Check event rates
+df_dca_csph %>%
+  count(outcome_csph) %>%
+  mutate(prop = n / sum(n))
+
+# Run DCA for CSPH
+dca_csph_result <- dca(
+  formula = outcome_csph ~ strategy_age35 + strategy_age40 + strategy_age45,
+  data = df_dca_csph,
+  thresholds = seq(0, 0.5, by = 0.01),
+  label = list(
+    strategy_age35 = "Age > 35",
+    strategy_age40 = "Age > 40",
+    strategy_age45 = "Age > 45"
+  )
+)
+
+# Plot
+dca_csph_result %>%
+  as_tibble() %>%
+  mutate(label = str_replace(label, "Treat All", "Screen All")) %>%
+  mutate(label = str_replace(label, "Treat None", "Screen None")) %>%
+  ggplot(aes(x = threshold, y = net_benefit, color = label, linetype = label)) +
+  geom_line(linewidth = 1) +
+  scale_x_continuous(limits = c(0, 0.3), labels = scales::percent) +
+  scale_y_continuous(limits = c(-0.01, NA)) + # Zoom in on relevant positive range
+  scale_linetype_manual(
+    values = c(
+      "Screen All" = "solid",
+      "Screen None" = "dotted",
+      "Age > 35" = "solid",
+      "Age > 40" = "solid",
+      "Age > 45" = "solid"
+    )
+  ) +
+  scale_color_manual(
+    values = c(
+      "Screen All" = "black",
+      "Screen None" = "black",
+      "Age > 35" = "#1b9e77",
+      "Age > 40" = "#d95f02",
+      "Age > 45" = "#7570b3"
+    )
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Decision Curve Analysis: Age-based Strategies for CSPH (> 20 kPa)",
+    x = "Threshold Probability",
+    y = "Net Benefit",
+    color = "Strategy",
+    linetype = "Strategy"
+  )
+
+ggsave("Results/DCA/DCA_Age_Strategies_CSPH.png", width = 8, height = 5, dpi = 300)
+```

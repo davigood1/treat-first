@@ -1,0 +1,249 @@
+---
+title: "National impact (PBS HCV treatment dataset)"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(pacman)
+p_load(
+  haven,
+  dplyr,
+  readr,
+  ggplot2,
+  scales,
+  tidyr,
+  lubridate,
+  stringr
+)
+
+dir.create("Results/Impact", recursive = TRUE, showWarnings = FALSE)
+```
+
+# Load PBS dataset
+
+```{r}
+pbs_path <- "Data/Get data/PBS HCV dataset_March2025.dta"
+stopifnot(file.exists(pbs_path))
+
+pbs_raw <- read_dta(pbs_path)
+
+year_min <- 2017
+
+pbs_supplies <- pbs_raw %>%
+  transmute(
+    pt_id = as.character(pt_id),
+    pt_age = suppressWarnings(as.numeric(pt_age)),
+    pt_sex = haven::as_factor(pt_sex),
+    supply_date = as.Date(datesupply)
+  ) %>%
+  mutate(year = lubridate::year(supply_date))
+
+# Patient-year table (unique patients treated in each calendar year)
+pbs_pt_year <- pbs_supplies %>%
+  filter(!is.na(year), year >= year_min) %>%
+  group_by(year, pt_id) %>%
+  summarise(
+    pt_age = suppressWarnings(first(na.omit(pt_age))),
+    pt_sex = suppressWarnings(first(na.omit(pt_sex))),
+    .groups = "drop"
+  )
+
+# Patient-level first supply within the analysis period (for overall calculations)
+pbs_pt_first_in_period <- pbs_supplies %>%
+  filter(!is.na(year), year >= year_min, !is.na(supply_date)) %>%
+  group_by(pt_id) %>%
+  slice_min(supply_date, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(pt_id, pt_age, pt_sex, first_supply_date = supply_date, year)
+
+cat("PBS supply rows:", nrow(pbs_supplies), "\n")
+cat(
+  "Supply date range:",
+  format(min(pbs_supplies$supply_date, na.rm = TRUE)),
+  "to",
+  format(max(pbs_supplies$supply_date, na.rm = TRUE)),
+  "\n"
+)
+cat("Unique patients (any year):", n_distinct(pbs_supplies$pt_id), "\n")
+cat("Unique patient-years (>=", year_min, "):", nrow(pbs_pt_year), "\n", sep = "")
+```
+
+# National treatment volume
+
+```{r}
+p_by_year_df <- pbs_pt_year %>%
+  count(year, name = "unique_patients") %>%
+  arrange(year)
+
+write_csv(p_by_year_df, "Results/Impact/PBS_UniquePatients_byYear.csv")
+
+p_by_year <- p_by_year_df %>%
+  ggplot(aes(x = year, y = unique_patients)) +
+  geom_col(fill = "grey30") +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "PBS HCV treatment (unique patients by year of supply)",
+    x = "Year (datesupply)",
+    y = "Patients"
+  ) +
+  theme_minimal()
+
+p_by_year
+ggsave("Results/Impact/PBS_TreatedPatients_byYear.png", plot = p_by_year, width = 8, height = 5, dpi = 300)
+```
+
+# Age-cutoff strategy impact on fibrosis assessment
+
+Assumption for this simple impact calculation: a fibrosis assessment (e.g., FibroScan) is required for people above an age cutoff, and is not required for those at or below the cutoff.
+
+```{r}
+cutoffs <- c(35, 40, 45, 50)
+
+impact_overall <- pbs_pt_first_in_period %>%
+  tidyr::crossing(cutoff = cutoffs) %>%
+  group_by(cutoff) %>%
+  summarise(
+    n_total = n(),
+    n_with_age = sum(!is.na(pt_age)),
+    n_assess = sum(pt_age > cutoff, na.rm = TRUE),
+    n_no_assess = sum(pt_age <= cutoff, na.rm = TRUE),
+    pct_assess = n_assess / n_with_age,
+    .groups = "drop"
+  )
+
+impact_overall
+write_csv(impact_overall, "Results/Impact/PBS_AgeCutoff_AssessmentImpact_overall.csv")
+
+p_assess_overall <- impact_overall %>%
+  mutate(cutoff = factor(paste0(">", cutoff), levels = paste0(">", cutoffs))) %>%
+  ggplot(aes(x = cutoff, y = n_assess)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = scales::comma(n_assess)), vjust = -0.3, size = 3) +
+  scale_y_continuous(labels = scales::comma, expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title = "Estimated fibrosis assessments required (PBS treated patients)",
+    x = "Age cutoff strategy",
+    y = "Patients needing assessment"
+  ) +
+  theme_minimal()
+
+p_assess_overall
+ggsave("Results/Impact/PBS_AssessmentsRequired_byAgeCutoff.png", plot = p_assess_overall, width = 8, height = 5, dpi = 300)
+```
+
+```{r}
+impact_by_year <- pbs_pt_year %>%
+  filter(!is.na(pt_age)) %>%
+  tidyr::crossing(cutoff = cutoffs) %>%
+  group_by(year, cutoff) %>%
+  summarise(
+    n_treated = n(),
+    n_assess = sum(pt_age > cutoff),
+    n_no_assess = sum(pt_age <= cutoff),
+    .groups = "drop"
+  )
+
+write_csv(impact_by_year, "Results/Impact/PBS_AgeCutoff_AssessmentImpact_byYear.csv")
+
+p_assess_by_year <- impact_by_year %>%
+  mutate(cutoff = factor(cutoff)) %>%
+  ggplot(aes(x = year, y = n_assess, color = cutoff, group = cutoff)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_y_continuous(labels = scales::comma) +
+  scale_color_brewer(palette = "Dark2", name = "Cutoff") +
+  labs(
+    title = "Assessments required over time under age-cutoff strategies",
+    x = "Year (first supply)",
+    y = "Patients needing assessment"
+  ) +
+  theme_minimal()
+
+p_assess_by_year
+ggsave("Results/Impact/PBS_AssessmentsRequired_byAgeCutoff_byYear.png", plot = p_assess_by_year, width = 9, height = 5, dpi = 300)
+```
+
+# Illustrative extrapolation: expected high FSM among those not assessed
+
+This section applies the age-bin prevalence of high FSM from the study cohort (Data/merged_data.csv) to the PBS-treated patient counts.
+
+```{r}
+cohort_path <- "Data/merged_data.csv"
+stopifnot(file.exists(cohort_path))
+
+cohort <- readr::read_csv(cohort_path, show_col_types = FALSE) %>%
+  filter(!is.na(age), !is.na(fsm)) %>%
+  mutate(
+    age_bin = cut(
+      age,
+      breaks = c(-Inf, 35, 40, 45, Inf),
+      right = FALSE,
+      labels = c("<35", "35-39", "40-44", "45+")
+    ),
+    fsm_12_5 = fsm >= 12.5,
+    fsm_20 = fsm >= 20
+  )
+
+prev_by_agebin <- cohort %>%
+  group_by(age_bin) %>%
+  summarise(
+    n_cohort = n(),
+    prev_fsm_12_5 = mean(fsm_12_5),
+    prev_fsm_20 = mean(fsm_20),
+    .groups = "drop"
+  )
+
+write_csv(prev_by_agebin, "Results/Impact/Cohort_Prevalence_byAgeBin.csv")
+
+pbs_pt_bins <- pbs_pt_first_in_period %>%
+  filter(!is.na(pt_age)) %>%
+  mutate(
+    age_bin = cut(
+      pt_age,
+      breaks = c(-Inf, 35, 40, 45, Inf),
+      right = FALSE,
+      labels = c("<35", "35-39", "40-44", "45+")
+    )
+  )
+
+missed_tbl <- tidyr::crossing(cutoff = cutoffs) %>%
+  mutate(
+    n_not_assessed = vapply(cutoff, function(c) sum(pbs_pt_bins$pt_age <= c), numeric(1)),
+    exp_missed_fsm_12_5 = vapply(cutoff, function(c) {
+      pbs_pt_bins %>%
+        filter(pt_age <= c) %>%
+        count(age_bin, name = "n") %>%
+        left_join(prev_by_agebin, by = "age_bin") %>%
+        summarise(exp = sum(n * prev_fsm_12_5, na.rm = TRUE), .groups = "drop") %>%
+        pull(exp)
+    }, numeric(1)),
+    exp_missed_fsm_20 = vapply(cutoff, function(c) {
+      pbs_pt_bins %>%
+        filter(pt_age <= c) %>%
+        count(age_bin, name = "n") %>%
+        left_join(prev_by_agebin, by = "age_bin") %>%
+        summarise(exp = sum(n * prev_fsm_20, na.rm = TRUE), .groups = "drop") %>%
+        pull(exp)
+    }, numeric(1))
+  )
+
+write_csv(missed_tbl, "Results/Impact/PBS_EstimatedMissedFSM_byAgeCutoff.csv")
+missed_tbl
+
+p_missed <- missed_tbl %>%
+  mutate(cutoff = factor(paste0("<=", cutoff), levels = paste0("<=", cutoffs))) %>%
+  ggplot(aes(x = cutoff, y = exp_missed_fsm_12_5)) +
+  geom_col(fill = "firebrick") +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Expected FSM >= 12.5 among not-assessed (illustrative)",
+    x = "Not assessed group definition",
+    y = "Expected FSM >= 12.5"
+  ) +
+  theme_minimal()
+
+p_missed
+ggsave("Results/Impact/PBS_EstimatedMissedFSM12_5_byAgeCutoff.png", plot = p_missed, width = 8, height = 5, dpi = 300)
+```
