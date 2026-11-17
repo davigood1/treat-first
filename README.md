@@ -16,9 +16,43 @@ Rscript scripts/figure_5_rebuild.R
 
 The Figure 5 calculation defines clinically significant portal hypertension as liver stiffness **greater than 20 kPa**. Its published bars are the share of NSW adult notifications below ages 35, 40, and 45; the bottom rows show estimated counts. The EPS outputs are vector figures and the PNG is exported at 600 dpi.
 
+## Manuscript figures
+
+The PNGs below are previews for GitHub. Use the linked EPS files for submission.
+
+### Figure 1. Study flow
+
+![Figure 1: study flow diagram](outputs/figures/Figure_1_preview.png)
+
+[Download Figure 1 EPS](outputs/figures/Figure_1_600dpi.eps)
+
+### Figure 2. Liver stiffness by age and study
+
+![Figure 2: liver stiffness plotted against age by study](outputs/figures/Figure_2_preview.png)
+
+[Download Figure 2 EPS](outputs/figures/Figure_2_600dpi.eps)
+
+### Figure 3. Decision curves for cirrhosis and portal hypertension
+
+![Figure 3: overall decision curves](outputs/figures/Figure_3_preview.png)
+
+[Download Figure 3 EPS](outputs/figures/Figure_3_600dpi.eps)
+
+### Figure 4. Decision curves by subgroup
+
+![Figure 4: subgroup decision curves](outputs/figures/Figure_4_preview.png)
+
+[Download Figure 4 EPS](outputs/figures/Figure_4_600dpi.eps)
+
+### Figure 5. Estimated impact of age cutoffs in NSW
+
+![Figure 5: NSW age-cutoff impact](outputs/figures/Figure_5_600dpi.png)
+
+[Download Figure 5 EPS](outputs/figures/Figure_5_600dpi.eps)
+
 ## Repository contents
 
 - `scripts/`: the analysis notebooks and the Figure 5 rebuild script.
-- `outputs/figures/`: five manuscript EPS figures without an overall title, plus a Figure 5 PNG preview.
+- `outputs/figures/`: five manuscript EPS figures without an overall title and PNG previews for GitHub.
 
 No raw participant records, harmonized datasets, source workbooks, or CSV result tables are tracked. The figures are aggregate outputs. Check the manuscript and supplement against newly generated outputs before submission.
